@@ -1,0 +1,71 @@
+# Configuration file for Insurance Renewal Prediction
+
+data:
+  train_path: "dataset/WA_Fn-UseC_-Marketing-Customer-Value-Analysis.csv"
+  target_column: "Response"
+  test_size: 0.2
+  random_state: 42
+  stratify: true
+
+features:
+  # Set to true to auto-discover features from data
+  use_auto_discovery: false
+  
+  categorical_features:
+    - "State"
+    - "Coverage"
+    - "Education"
+    - "EmploymentStatus"
+    - "Gender"
+    - "Location Code"
+    - "Marital Status"
+    - "Policy Type"
+    - "Policy"
+    - "Renew Offer Type"
+    - "Sales Channel"
+    - "Vehicle Class"
+    - "Vehicle Size"
+  
+  numerical_features:
+    - "Customer Lifetime Value"
+    - "Income"
+    - "Monthly Premium Auto"
+    - "Months Since Last Claim"
+    - "Months Since Policy Inception"
+    - "Number of Open Complaints"
+    - "Number of Policies"
+    - "Total Claim Amount"
+  
+  drop_features:
+    - "Customer"
+    - "Effective To Date"
+
+model:
+  models:
+    - "lightgbm"
+    - "xgboost"
+    - "catboost"
+    - "ensemble"
+  
+  cv_folds: 5
+  scoring: "roc_auc"
+  n_trials: 100
+  
+  ensemble:
+    method: "voting"  # voting or stacking
+    weights: null  # null for auto, or list of weights
+
+training:
+  early_stopping_rounds: 100
+  verbose: true
+  use_gpu: false
+
+api:
+  host: "0.0.0.0"
+  port: 8000
+  reload: false
+
+paths:
+  models_dir: "models"
+  outputs_dir: "outputs"
+  logs_dir: "logs"
