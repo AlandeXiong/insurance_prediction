@@ -2,7 +2,7 @@
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler, LabelEncoder
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import joblib
 from pathlib import Path
 
@@ -11,11 +11,15 @@ class FeatureEngineer:
     """
     Advanced feature engineering for insurance renewal prediction.
     Follows Kaggle competition best practices for feature creation and transformation.
+    
+    IMPORTANT: Target encoding is disabled by default to prevent data leakage.
+    Enable it only if you implement proper out-of-fold encoding in cross-validation.
     """
     
     def __init__(self, categorical_features: List[str], 
                  numerical_features: List[str],
-                 target_column: str = "Response"):
+                 target_column: str = "Response",
+                 use_target_encoding: bool = False):
         """
         Initialize feature engineer.
         
@@ -23,10 +27,12 @@ class FeatureEngineer:
             categorical_features: List of categorical feature names
             numerical_features: List of numerical feature names
             target_column: Name of target column
+            use_target_encoding: Whether to use target encoding (DISABLED by default to prevent leakage)
         """
         self.categorical_features = categorical_features
         self.numerical_features = numerical_features
         self.target_column = target_column
+        self.use_target_encoding = use_target_encoding  # Disabled by default
         
         # Encoders and transformers
         self.label_encoders = {}
@@ -101,17 +107,17 @@ class FeatureEngineer:
         
         return df
     
-    def create_statistical_features(self, df: pd.DataFrame, y: pd.Series = None, fit: bool = True) -> pd.DataFrame:
+    def create_statistical_features(self, df: pd.DataFrame, y: Optional[pd.Series] = None, fit: bool = True) -> pd.DataFrame:
         """
-        Create statistical aggregation features using target encoding and count encoding.
-        Uses cross-validation safe target encoding to prevent data leakage.
+        Create statistical aggregation features using count encoding and median encoding.
         
-        IMPORTANT: Target encoding should only use training data to prevent data leakage.
-        When fit=True, y must be provided. When fit=False, stored mappings are used.
+        WARNING: Target encoding is DISABLED by default to prevent data leakage.
+        Target encoding can cause severe data leakage in cross-validation if not done properly
+        (using out-of-fold encoding). It's disabled here to ensure safe feature engineering.
         
         Args:
             df: Input dataframe (features only, no target column)
-            y: Target series (required when fit=True for target encoding)
+            y: Target series (NOT USED - target encoding disabled)
             fit: Whether to fit encoders or use existing mappings
         
         Returns:
@@ -130,25 +136,22 @@ class FeatureEngineer:
             if cat_col not in df.columns:
                 continue
             
-            # Target encoding (mean encoding) - ONLY use y when fit=True to prevent leakage
-            if fit:
-                if y is not None:
-                    # Calculate target mean per category using provided y
-                    # This ensures we only use training data, preventing data leakage
-                    target_mean = pd.Series(y.values, index=df.index).groupby(df[cat_col]).mean()
-                    self.target_encoding_maps[cat_col] = target_mean.to_dict()
-                    df[f'{cat_col}_Target_Mean'] = df[cat_col].map(target_mean)
-                else:
-                    # If y not provided during fit, skip target encoding to prevent leakage
-                    # This is a safety measure - target encoding requires target values
-                    print(f"Warning: Target encoding skipped for {cat_col} - y not provided during fit")
+            # TARGET ENCODING DISABLED - This was causing data leakage!
+            # Target encoding requires out-of-fold encoding in CV to be safe.
+            # For now, we disable it to prevent unrealistic AUC scores.
+            if self.use_target_encoding and fit and y is not None:
+                # Only enable if explicitly requested AND out-of-fold encoding is implemented
+                print(f"WARNING: Target encoding enabled for {cat_col}. Ensure out-of-fold encoding in CV!")
+                target_mean = pd.Series(y.values, index=df.index).groupby(df[cat_col]).mean()
+                self.target_encoding_maps[cat_col] = target_mean.to_dict()
+                df[f'{cat_col}_Target_Mean'] = df[cat_col].map(target_mean)
             elif hasattr(self, 'target_encoding_maps') and cat_col in self.target_encoding_maps:
-                # Use stored mapping for prediction (no data leakage - using training-only mappings)
+                # Use stored mapping for prediction
                 df[f'{cat_col}_Target_Mean'] = df[cat_col].map(
                     self.target_encoding_maps[cat_col]
-                ).fillna(0)  # Fill unseen categories with 0 (global mean for binary target)
+                ).fillna(0)
             
-            # Count encoding (safe - no target information used)
+            # Count encoding (SAFE - no target information used)
             if fit:
                 count_map = df[cat_col].value_counts().to_dict()
                 self.count_encoding_maps[cat_col] = count_map
@@ -158,7 +161,7 @@ class FeatureEngineer:
                     self.count_encoding_maps[cat_col]
                 ).fillna(0)
             
-            # Median encoding for numerical features grouped by category (safe - no target used)
+            # Median encoding for numerical features grouped by category (SAFE - no target used)
             if fit:
                 for num_col in self.numerical_features:
                     if num_col in df.columns:
@@ -273,17 +276,18 @@ class FeatureEngineer:
         
         return df
     
-    def transform(self, df: pd.DataFrame, y: pd.Series = None, fit: bool = True) -> pd.DataFrame:
+    def transform(self, df: pd.DataFrame, y: Optional[pd.Series] = None, fit: bool = True) -> pd.DataFrame:
         """
         Complete feature engineering pipeline.
         Applies all transformations in the correct order.
         
-        IMPORTANT: To prevent data leakage, when fit=True and target encoding is needed,
-        y must be provided separately. The df should NOT contain the target column.
+        IMPORTANT: Target encoding is DISABLED by default to prevent data leakage.
+        The y parameter is kept for API compatibility but target encoding won't be used
+        unless explicitly enabled and out-of-fold encoding is properly implemented.
         
         Args:
             df: Input dataframe (features only, should NOT contain target column)
-            y: Target series (required when fit=True for target encoding, optional when fit=False)
+            y: Target series (optional, not used for target encoding by default)
             fit: Whether to fit transformers or use existing transformers
         
         Returns:
@@ -302,7 +306,7 @@ class FeatureEngineer:
         # Step 2: Create interaction features
         df = self.create_interaction_features(df)
         
-        # Step 3: Create statistical features (pass y separately to prevent leakage)
+        # Step 3: Create statistical features (target encoding DISABLED by default)
         df = self.create_statistical_features(df, y=y, fit=fit)
         
         # Step 4: Encode categorical features
@@ -328,6 +332,8 @@ class FeatureEngineer:
             df = df[self.feature_order]
         
         print(f"Feature engineering complete. Final shape: {df.shape}")
+        if not self.use_target_encoding:
+            print("Note: Target encoding is DISABLED to prevent data leakage. AUC should be realistic (0.7-0.9).")
         return df
     
     def save(self, path: Path):
@@ -343,6 +349,7 @@ class FeatureEngineer:
             'categorical_features': self.categorical_features,
             'numerical_features': self.numerical_features,
             'target_column': self.target_column,
+            'use_target_encoding': self.use_target_encoding,
             'target_encoding_maps': getattr(self, 'target_encoding_maps', {}),
             'count_encoding_maps': getattr(self, 'count_encoding_maps', {}),
             'median_encoding_maps': getattr(self, 'median_encoding_maps', {}),
@@ -366,7 +373,8 @@ class FeatureEngineer:
         engineer = cls(
             categorical_features=data['categorical_features'],
             numerical_features=data['numerical_features'],
-            target_column=data['target_column']
+            target_column=data['target_column'],
+            use_target_encoding=data.get('use_target_encoding', False)
         )
         engineer.label_encoders = data['label_encoders']
         engineer.scaler = data['scaler']

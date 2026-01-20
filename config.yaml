@@ -11,6 +11,11 @@ features:
   # Set to true to auto-discover features from data
   use_auto_discovery: false
   
+  # WARNING: Target encoding causes data leakage in cross-validation!
+  # It will lead to unrealistic AUC > 0.99. Keep it disabled unless you implement
+  # proper out-of-fold encoding in CV.
+  use_target_encoding: false  # DISABLED by default to prevent data leakage
+  
   categorical_features:
     - "State"
     - "Coverage"

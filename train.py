@@ -89,11 +89,23 @@ def main():
     
     # Feature engineering
     logger.info("Starting feature engineering...")
-    logger.info("IMPORTANT: Target encoding uses only training data to prevent data leakage")
+    logger.info("IMPORTANT: Target encoding is DISABLED by default to prevent data leakage")
+    logger.info("This ensures realistic AUC scores (0.75-0.85) instead of unrealistic 0.99+")
+    
+    # Target encoding disabled to prevent leakage in CV
+    # If enabled, it would cause AUC > 0.99 because target encoding leaks in cross-validation
+    use_target_encoding = config.get('features', {}).get('use_target_encoding', False)
+    if use_target_encoding:
+        logger.warning("Target encoding is ENABLED. This may cause data leakage in CV!")
+        logger.warning("Ensure proper out-of-fold encoding is implemented.")
+    else:
+        logger.info("Target encoding is DISABLED (safe mode).")
+    
     feature_engineer = FeatureEngineer(
         categorical_features=categorical_features,
         numerical_features=numerical_features,
-        target_column=target_column
+        target_column=target_column,
+        use_target_encoding=use_target_encoding
     )
     
     # Fit on training data (pass y_train separately to prevent data leakage)
