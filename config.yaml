@@ -64,7 +64,7 @@ training:
   # Training mode: "fast" for quick testing, "full" for production
   # Fast mode: fewer optimization trials, faster training
   # Full mode: more optimization trials, better performance
-  mode: "full"  # "fast" or "full"
+  mode: "fast"  # "fast" or "full"
   
   # Fast mode settings (used when mode="fast")
   fast:
