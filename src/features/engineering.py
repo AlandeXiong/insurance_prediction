@@ -101,13 +101,17 @@ class FeatureEngineer:
         
         return df
     
-    def create_statistical_features(self, df: pd.DataFrame, fit: bool = True) -> pd.DataFrame:
+    def create_statistical_features(self, df: pd.DataFrame, y: pd.Series = None, fit: bool = True) -> pd.DataFrame:
         """
         Create statistical aggregation features using target encoding and count encoding.
-        Uses cross-validation safe target encoding to prevent overfitting.
+        Uses cross-validation safe target encoding to prevent data leakage.
+        
+        IMPORTANT: Target encoding should only use training data to prevent data leakage.
+        When fit=True, y must be provided. When fit=False, stored mappings are used.
         
         Args:
-            df: Input dataframe
+            df: Input dataframe (features only, no target column)
+            y: Target series (required when fit=True for target encoding)
             fit: Whether to fit encoders or use existing mappings
         
         Returns:
@@ -126,19 +130,25 @@ class FeatureEngineer:
             if cat_col not in df.columns:
                 continue
             
-            # Target encoding (mean encoding)
-            if fit and self.target_column in df.columns:
-                # Calculate target mean per category
-                target_mean = df.groupby(cat_col)[self.target_column].mean()
-                self.target_encoding_maps[cat_col] = target_mean.to_dict()
-                df[f'{cat_col}_Target_Mean'] = df[cat_col].map(target_mean)
+            # Target encoding (mean encoding) - ONLY use y when fit=True to prevent leakage
+            if fit:
+                if y is not None:
+                    # Calculate target mean per category using provided y
+                    # This ensures we only use training data, preventing data leakage
+                    target_mean = pd.Series(y.values, index=df.index).groupby(df[cat_col]).mean()
+                    self.target_encoding_maps[cat_col] = target_mean.to_dict()
+                    df[f'{cat_col}_Target_Mean'] = df[cat_col].map(target_mean)
+                else:
+                    # If y not provided during fit, skip target encoding to prevent leakage
+                    # This is a safety measure - target encoding requires target values
+                    print(f"Warning: Target encoding skipped for {cat_col} - y not provided during fit")
             elif hasattr(self, 'target_encoding_maps') and cat_col in self.target_encoding_maps:
-                # Use stored mapping for prediction
+                # Use stored mapping for prediction (no data leakage - using training-only mappings)
                 df[f'{cat_col}_Target_Mean'] = df[cat_col].map(
                     self.target_encoding_maps[cat_col]
-                ).fillna(0)  # Fill unseen categories with global mean (0 for binary)
+                ).fillna(0)  # Fill unseen categories with 0 (global mean for binary target)
             
-            # Count encoding
+            # Count encoding (safe - no target information used)
             if fit:
                 count_map = df[cat_col].value_counts().to_dict()
                 self.count_encoding_maps[cat_col] = count_map
@@ -148,8 +158,8 @@ class FeatureEngineer:
                     self.count_encoding_maps[cat_col]
                 ).fillna(0)
             
-            # Median encoding for numerical features grouped by category
-            if fit and self.target_column in df.columns:
+            # Median encoding for numerical features grouped by category (safe - no target used)
+            if fit:
                 for num_col in self.numerical_features:
                     if num_col in df.columns:
                         median_map = df.groupby(cat_col)[num_col].median().to_dict()
@@ -263,19 +273,28 @@ class FeatureEngineer:
         
         return df
     
-    def transform(self, df: pd.DataFrame, fit: bool = True) -> pd.DataFrame:
+    def transform(self, df: pd.DataFrame, y: pd.Series = None, fit: bool = True) -> pd.DataFrame:
         """
         Complete feature engineering pipeline.
         Applies all transformations in the correct order.
         
+        IMPORTANT: To prevent data leakage, when fit=True and target encoding is needed,
+        y must be provided separately. The df should NOT contain the target column.
+        
         Args:
-            df: Input dataframe
+            df: Input dataframe (features only, should NOT contain target column)
+            y: Target series (required when fit=True for target encoding, optional when fit=False)
             fit: Whether to fit transformers or use existing transformers
         
         Returns:
-            Transformed dataframe
+            Transformed dataframe (target column removed if present)
         """
         print("Starting feature engineering pipeline...")
+        
+        # Safety check: Remove target column if accidentally included (prevent leakage)
+        if self.target_column in df.columns:
+            print(f"Warning: Target column '{self.target_column}' found in features. Removing to prevent data leakage.")
+            df = df.drop(columns=[self.target_column])
         
         # Step 1: Handle missing values
         df = self.handle_missing_values(df)
@@ -283,8 +302,8 @@ class FeatureEngineer:
         # Step 2: Create interaction features
         df = self.create_interaction_features(df)
         
-        # Step 3: Create statistical features
-        df = self.create_statistical_features(df, fit=fit)
+        # Step 3: Create statistical features (pass y separately to prevent leakage)
+        df = self.create_statistical_features(df, y=y, fit=fit)
         
         # Step 4: Encode categorical features
         df = self.encode_categorical(df, fit=fit)
@@ -295,7 +314,7 @@ class FeatureEngineer:
         # Step 6: Store feature order on fit (for prediction consistency)
         if fit:
             self.feature_order = df.columns.tolist()
-            # Remove target if present
+            # Ensure target is not in feature order
             if self.target_column in self.feature_order:
                 self.feature_order.remove(self.target_column)
         

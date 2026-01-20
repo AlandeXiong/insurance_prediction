@@ -89,16 +89,18 @@ def main():
     
     # Feature engineering
     logger.info("Starting feature engineering...")
+    logger.info("IMPORTANT: Target encoding uses only training data to prevent data leakage")
     feature_engineer = FeatureEngineer(
         categorical_features=categorical_features,
         numerical_features=numerical_features,
         target_column=target_column
     )
     
-    # Fit on training data
-    X_train_processed = feature_engineer.transform(X_train, fit=True)
+    # Fit on training data (pass y_train separately to prevent data leakage)
+    # This ensures target encoding only uses training data, not test data
+    X_train_processed = feature_engineer.transform(X_train, y=y_train, fit=True)
     
-    # Transform test data
+    # Transform test data (no y needed - uses stored mappings from training)
     X_test_processed = feature_engineer.transform(X_test, fit=False)
     
     logger.info(f"Processed train set: {X_train_processed.shape}")
@@ -111,16 +113,40 @@ def main():
     
     # Model training
     logger.info("Starting model training and optimization...")
+    
+    # Determine training mode (fast or full)
+    training_mode = config['training'].get('mode', 'full')
+    logger.info(f"Training mode: {training_mode.upper()}")
+    
+    if training_mode == 'fast':
+        # Fast mode: fewer trials, fewer models, faster training
+        fast_config = config['training'].get('fast', {})
+        cv_folds = fast_config.get('cv_folds', 3)
+        n_trials = fast_config.get('n_trials', 20)
+        models_to_train = fast_config.get('models', ['lightgbm', 'ensemble'])
+        logger.info("FAST MODE: Using reduced settings for quick training")
+        logger.info(f"  CV folds: {cv_folds} (reduced from {config['model']['cv_folds']})")
+        logger.info(f"  Optimization trials: {n_trials} (reduced from {config['model']['n_trials']})")
+        logger.info(f"  Models: {models_to_train} (reduced set)")
+    else:
+        # Full mode: standard settings for best performance
+        full_config = config['training'].get('full', {})
+        cv_folds = full_config.get('cv_folds', config['model']['cv_folds'])
+        n_trials = full_config.get('n_trials', config['model']['n_trials'])
+        models_to_train = full_config.get('models', config['model']['models'])
+        logger.info("FULL MODE: Using full settings for best performance")
+        logger.info(f"  CV folds: {cv_folds}")
+        logger.info(f"  Optimization trials: {n_trials}")
+        logger.info(f"  Models: {models_to_train}")
+    
     trainer = ModelTrainer(
-        cv_folds=config['model']['cv_folds'],
+        cv_folds=cv_folds,
         random_state=config['data']['random_state'],
         scoring=config['model']['scoring'],
-        n_trials=config['model']['n_trials']
+        n_trials=n_trials
     )
     
-    # Train models
-    models_to_train = config['model']['models']
-    logger.info(f"Models to train: {models_to_train}")
+    logger.info(f"Training {len(models_to_train)} model(s): {models_to_train}")
     
     if 'lightgbm' in models_to_train:
         logger.info("Training LightGBM...")

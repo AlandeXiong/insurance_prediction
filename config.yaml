@@ -56,6 +56,23 @@ model:
     weights: null  # null for auto, or list of weights
 
 training:
+  # Training mode: "fast" for quick testing, "full" for production
+  # Fast mode: fewer optimization trials, faster training
+  # Full mode: more optimization trials, better performance
+  mode: "full"  # "fast" or "full"
+  
+  # Fast mode settings (used when mode="fast")
+  fast:
+    n_trials: 20  # Reduced optimization trials
+    cv_folds: 3  # Fewer CV folds
+    models: ["lightgbm", "ensemble"]  # Fewer models to train
+  
+  # Full mode settings (used when mode="full")
+  full:
+    n_trials: 100  # Full optimization trials
+    cv_folds: 5  # Standard CV folds
+    models: ["lightgbm", "xgboost", "catboost", "ensemble"]  # All models
+  
   early_stopping_rounds: 100
   verbose: true
   use_gpu: false

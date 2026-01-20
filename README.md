@@ -221,7 +221,36 @@ model:
   models: ["lightgbm", "xgboost", "catboost", "ensemble"]
   cv_folds: 5
   n_trials: 100  # Hyperparameter optimization trials
+
+training:
+  mode: "full"  # "fast" for quick testing, "full" for production
+  
+  # Fast mode: ~5-10 minutes, good for development
+  fast:
+    n_trials: 20
+    cv_folds: 3
+    models: ["lightgbm", "ensemble"]
+  
+  # Full mode: ~30-60 minutes, best performance
+  full:
+    n_trials: 100
+    cv_folds: 5
+    models: ["lightgbm", "xgboost", "catboost", "ensemble"]
 ```
+
+### Training Modes
+
+- **Fast Mode**: Quick testing and development (~5-10 min)
+  - Fewer optimization trials (20)
+  - Fewer CV folds (3)
+  - Fewer models (LightGBM + Ensemble)
+  
+- **Full Mode**: Production training (~30-60 min)
+  - Full optimization (100 trials)
+  - Standard CV (5 folds)
+  - All models (LightGBM, XGBoost, CatBoost, Ensemble)
+
+See [TRAINING_MODES.md](TRAINING_MODES.md) for details.
 
 ## 📝 Best Practices
 
@@ -237,6 +266,19 @@ This project follows Kaggle competition best practices:
 8. **Comprehensive Reporting**: Complete training and evaluation reports
 9. **Auto Feature Discovery**: Automatic feature identification
 10. **API Design**: RESTful API with proper error handling
+11. **Data Leakage Prevention**: Target encoding uses only training data
+12. **Flexible Training Modes**: Fast mode for development, full mode for production
+
+## 🔒 Data Leakage Prevention
+
+The system implements strict data leakage prevention:
+
+- **Target Encoding Safety**: Target variable passed separately, ensuring only training data is used
+- **Automatic Checks**: Target column automatically removed if accidentally included in features
+- **Explicit Separation**: Clear separation between feature data and target data
+- **Training/Test Isolation**: Test data never used for feature engineering
+
+See [DATA_LEAKAGE_FIX.md](DATA_LEAKAGE_FIX.md) for detailed documentation.
 
 ## 🛠️ Dependencies
 

@@ -11,7 +11,7 @@ plotly==5.18.0
 # Advanced ML Models
 lightgbm==4.1.0
 xgboost==2.0.3
-catboost==1.2.2
+catboost==1.2.5
 
 # Model Selection & Optimization
 optuna==3.5.0
@@ -19,8 +19,8 @@ scikit-optimize==0.9.0
 
 # API Framework
 fastapi==0.109.0
-uvicorn[standard]==0.27.0
-pydantic==2.5.3
+uvicorn[standard]==0.31.0
+pydantic==2.11
 
 # Utilities
 python-dotenv==1.0.0
@@ -30,4 +30,4 @@ pyyaml==6.0.1
 
 # Data Processing
 imbalanced-learn==0.11.0
-shap==0.44.0
+shap==0.45.0

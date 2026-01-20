@@ -88,8 +88,8 @@ class Predictor:
         data_dict = request.dict(by_alias=True)
         df = pd.DataFrame([data_dict])
         
-        # Feature engineering
-        df_processed = self.feature_engineer.transform(df, fit=False)
+        # Feature engineering (no y needed for prediction - uses stored mappings)
+        df_processed = self.feature_engineer.transform(df, y=None, fit=False)
         
         # Remove target column if present
         if 'Response' in df_processed.columns:
