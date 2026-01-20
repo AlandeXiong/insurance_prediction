@@ -127,7 +127,11 @@ class FeatureEngineer:
         
         # Initialize encoding maps if fitting
         if fit and not hasattr(self, 'target_encoding_maps'):
-            self.target_encoding_maps = {}
+            # Clear any existing target encoding maps if target encoding is disabled
+            if not self.use_target_encoding:
+                self.target_encoding_maps = {}  # Keep empty to prevent accidental use
+            else:
+                self.target_encoding_maps = {}
             self.count_encoding_maps = {}
             self.median_encoding_maps = {}
         
@@ -145,11 +149,13 @@ class FeatureEngineer:
                 target_mean = pd.Series(y.values, index=df.index).groupby(df[cat_col]).mean()
                 self.target_encoding_maps[cat_col] = target_mean.to_dict()
                 df[f'{cat_col}_Target_Mean'] = df[cat_col].map(target_mean)
-            elif hasattr(self, 'target_encoding_maps') and cat_col in self.target_encoding_maps:
-                # Use stored mapping for prediction
+            elif self.use_target_encoding and hasattr(self, 'target_encoding_maps') and cat_col in self.target_encoding_maps:
+                # Only use stored mapping if target encoding is explicitly enabled
                 df[f'{cat_col}_Target_Mean'] = df[cat_col].map(
                     self.target_encoding_maps[cat_col]
                 ).fillna(0)
+            # If target encoding is disabled, DO NOT create or use target-encoded features
+            # This prevents leakage from old saved models
             
             # Count encoding (SAFE - no target information used)
             if fit:

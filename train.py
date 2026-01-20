@@ -120,8 +120,25 @@ def main():
     
     # Save feature engineer
     feature_engineer_path = paths['models'] / 'feature_engineer.pkl'
+    
+    # Safety check: Warn if old feature engineer exists with target encoding
+    if feature_engineer_path.exists():
+        import joblib
+        try:
+            old_data = joblib.load(feature_engineer_path)
+            old_use_target = old_data.get('use_target_encoding', False)
+            old_maps = old_data.get('target_encoding_maps', {})
+            if old_use_target or old_maps:
+                logger.warning("="*80)
+                logger.warning("WARNING: Old feature engineer has target encoding enabled or maps exist!")
+                logger.warning("This may cause data leakage. Consider deleting old models.")
+                logger.warning("="*80)
+        except:
+            pass
+    
     feature_engineer.save(feature_engineer_path)
     logger.info(f"Feature engineer saved to {feature_engineer_path}")
+    logger.info(f"Target encoding enabled: {use_target_encoding}")
     
     # Model training
     logger.info("Starting model training and optimization...")
