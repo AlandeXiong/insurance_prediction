@@ -318,19 +318,24 @@ class ModelTrainer:
         """Train ensemble model"""
         print(f"\nTraining {method} ensemble...")
         
-        # Ensure base models are trained
-        if 'lightgbm' not in self.models:
-            self.train_lightgbm(X_train, y_train, X_val, y_val, optimize=False)
+        # Ensure base models are trained (only train models that exist in self.models)
+        # Note: lightgbm has been removed, only train xgboost and catboost
         if 'xgboost' not in self.models:
             self.train_xgboost(X_train, y_train, X_val, y_val, optimize=False)
         if 'catboost' not in self.models:
             self.train_catboost(X_train, y_train, X_val, y_val, optimize=False)
         
-        estimators = [
-            ('lgb', self.models['lightgbm']),
-            ('xgb', self.models['xgboost']),
-            ('cat', self.models['catboost'])
-        ]
+        # Build estimators list from available models (excluding lightgbm)
+        estimators = []
+        if 'xgboost' in self.models:
+            estimators.append(('xgb', self.models['xgboost']))
+        if 'catboost' in self.models:
+            estimators.append(('cat', self.models['catboost']))
+        
+        if not estimators:
+            raise ValueError("No base models available for ensemble. Train at least one model first.")
+        
+        print(f"Ensemble will use {len(estimators)} model(s): {[name for name, _ in estimators]}")
         
         ensemble = VotingClassifier(estimators=estimators, voting='soft')
         ensemble.fit(X_train, y_train)

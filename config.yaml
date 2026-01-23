@@ -47,7 +47,6 @@ features:
 
 model:
   models:
-    - "lightgbm"
     - "xgboost"
     - "catboost"
     - "ensemble"
@@ -70,13 +69,13 @@ training:
   fast:
     n_trials: 20  # Reduced optimization trials
     cv_folds: 3  # Fewer CV folds
-    models: ["lightgbm", "ensemble"]  # Fewer models to train
+    models: ["xgboost", "ensemble"]  # Fewer models to train
   
   # Full mode settings (used when mode="full")
   full:
     n_trials: 100  # Full optimization trials
     cv_folds: 5  # Standard CV folds
-    models: ["lightgbm", "xgboost", "catboost", "ensemble"]  # All models
+    models: ["xgboost", "catboost", "ensemble"]  # All models (lightgbm removed)
   
   early_stopping_rounds: 100
   verbose: true

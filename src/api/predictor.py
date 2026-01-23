@@ -57,7 +57,6 @@ class Predictor:
     def load_models(self):
         """Load all trained models"""
         model_files = {
-            'lightgbm': 'lightgbm_model.pkl',
             'xgboost': 'xgboost_model.pkl',
             'catboost': 'catboost_model.pkl',
             'ensemble': 'ensemble_model.pkl'
