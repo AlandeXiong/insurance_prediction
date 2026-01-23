@@ -92,7 +92,7 @@ def check_feature_target_correlation(df: pd.DataFrame, target_col: str, features
 
 def main():
     """Main diagnostic function"""
-    config_path = Path("config.yaml")
+    config_path = Path("../../config.yaml")
     if not config_path.exists():
         print("Error: config.yaml not found")
         sys.exit(1)

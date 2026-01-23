@@ -20,6 +20,32 @@ sns.set_style("whitegrid")
 plt.rcParams['figure.figsize'] = (12, 8)
 
 
+def convert_numpy_types(obj):
+    """
+    Recursively convert numpy types to Python native types for JSON serialization.
+    
+    Args:
+        obj: Object that may contain numpy types
+    
+    Returns:
+        Object with all numpy types converted to Python native types
+    """
+    if isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {key: convert_numpy_types(value) for key, value in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [convert_numpy_types(item) for item in obj]
+    elif pd.isna(obj):
+        return None
+    else:
+        return obj
+
+
 class ModelReportGenerator:
     """Generate comprehensive training and evaluation reports"""
     
@@ -59,20 +85,26 @@ class ModelReportGenerator:
         
         # Cross-validation summary
         for model_name, scores in cv_scores.items():
+            # Ensure all values are Python native types
+            scores_list = scores.tolist() if isinstance(scores, np.ndarray) else list(scores)
             report['cross_validation'][model_name] = {
                 'mean': float(np.mean(scores)),
                 'std': float(np.std(scores)),
                 'min': float(np.min(scores)),
                 'max': float(np.max(scores)),
-                'scores': scores.tolist() if isinstance(scores, np.ndarray) else scores
+                'scores': [convert_numpy_types(s) for s in scores_list]
             }
         
         # Test performance summary
         best_auc = 0
         for model_name, metrics in test_results.items():
-            report['test_performance'][model_name] = metrics
-            if metrics.get('roc_auc', 0) > best_auc:
-                best_auc = metrics['roc_auc']
+            # Convert numpy types to Python native types
+            report['test_performance'][model_name] = {
+                k: convert_numpy_types(v) for k, v in metrics.items()
+            }
+            roc_auc = float(metrics.get('roc_auc', 0))
+            if roc_auc > best_auc:
+                best_auc = roc_auc
                 report['best_model'] = model_name
         
         # Feature importance summary
@@ -81,11 +113,16 @@ class ModelReportGenerator:
                 # Get top 20 features
                 sorted_features = sorted(
                     importance_dict.items(), 
-                    key=lambda x: x[1], 
+                    key=lambda x: float(x[1]),  # Ensure float conversion
                     reverse=True
                 )[:20]
+                # Convert numpy types in feature importance
+                top_features_dict = {
+                    k: convert_numpy_types(v) 
+                    for k, v in sorted_features
+                }
                 report['feature_importance'][model_name] = {
-                    'top_features': dict(sorted_features),
+                    'top_features': top_features_dict,
                     'total_features': len(importance_dict)
                 }
         
@@ -93,10 +130,17 @@ class ModelReportGenerator:
         return report
     
     def save_report_json(self, filename: str = 'training_report.json'):
-        """Save report as JSON"""
+        """
+        Save report as JSON.
+        Converts all numpy types to Python native types for JSON serialization.
+        """
         report_path = self.output_dir / filename
+        
+        # Convert all numpy types to Python native types before saving
+        serializable_data = convert_numpy_types(self.report_data)
+        
         with open(report_path, 'w') as f:
-            json.dump(self.report_data, f, indent=2)
+            json.dump(serializable_data, f, indent=2, ensure_ascii=False)
         print(f"Report saved to {report_path}")
     
     def generate_performance_plots(self, 

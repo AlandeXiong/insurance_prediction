@@ -12,7 +12,7 @@ def check_all_leakage_sources():
     print("="*80)
     
     # Load config
-    config_path = Path("config.yaml")
+    config_path = Path("../../config.yaml")
     if not config_path.exists():
         print("Error: config.yaml not found")
         return

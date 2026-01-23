@@ -250,7 +250,7 @@ training:
   - Standard CV (5 folds)
   - All models (LightGBM, XGBoost, CatBoost, Ensemble)
 
-See [TRAINING_MODES.md](TRAINING_MODES.md) for details.
+See [TRAINING_MODES.md](doc/TRAINING_MODES.md) for details.
 
 ## 📝 Best Practices
 
@@ -278,7 +278,7 @@ The system implements strict data leakage prevention:
 - **Explicit Separation**: Clear separation between feature data and target data
 - **Training/Test Isolation**: Test data never used for feature engineering
 
-See [DATA_LEAKAGE_FIX.md](DATA_LEAKAGE_FIX.md) for detailed documentation.
+See [DATA_LEAKAGE_FIX.md](doc/DATA_LEAKAGE_FIX.md) for detailed documentation.
 
 ## 🛠️ Dependencies
 

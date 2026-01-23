@@ -6,7 +6,7 @@ from sklearn.metrics import (
     roc_auc_score, accuracy_score, precision_score, 
     recall_score, f1_score, classification_report, confusion_matrix
 )
-import lightgbm as lgb
+# Note: LightGBM has been removed from the system
 import xgboost as xgb
 from catboost import CatBoostClassifier
 from sklearn.ensemble import VotingClassifier
@@ -32,61 +32,7 @@ class ModelTrainer:
         self.cv_scores = {}
         self.feature_importance = {}
         
-    def optimize_lightgbm(self, X_train: pd.DataFrame, y_train: pd.Series) -> Dict[str, Any]:
-        """Optimize LightGBM hyperparameters"""
-        print("\nOptimizing LightGBM...")
-        
-        def objective(trial):
-            params = {
-                'objective': 'binary',
-                'metric': 'auc',
-                'boosting_type': 'gbdt',
-                'num_leaves': trial.suggest_int('num_leaves', 20, 300),
-                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3),
-                'feature_fraction': trial.suggest_float('feature_fraction', 0.4, 1.0),
-                'bagging_fraction': trial.suggest_float('bagging_fraction', 0.4, 1.0),
-                'bagging_freq': trial.suggest_int('bagging_freq', 1, 7),
-                'min_child_samples': trial.suggest_int('min_child_samples', 5, 100),
-                'reg_alpha': trial.suggest_float('reg_alpha', 1e-9, 10.0, log=True),
-                'reg_lambda': trial.suggest_float('reg_lambda', 1e-9, 10.0, log=True),
-                'random_state': self.random_state,
-                'verbosity': -1
-            }
-            
-            cv = StratifiedKFold(n_splits=self.cv_folds, shuffle=True, random_state=self.random_state)
-            scores = []
-            
-            for train_idx, val_idx in cv.split(X_train, y_train):
-                X_tr, X_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
-                y_tr, y_val = y_train.iloc[train_idx], y_train.iloc[val_idx]
-                
-                model = lgb.LGBMClassifier(**params, n_estimators=1000)
-                model.fit(X_tr, y_tr, 
-                         eval_set=[(X_val, y_val)],
-                         callbacks=[lgb.early_stopping(100), lgb.log_evaluation(0)])
-                
-                y_pred_proba = model.predict_proba(X_val)[:, 1]
-                score = roc_auc_score(y_val, y_pred_proba)
-                scores.append(score)
-            
-            return np.mean(scores)
-        
-        study = optuna.create_study(direction='maximize', study_name='lightgbm_opt')
-        study.optimize(objective, n_trials=self.n_trials, show_progress_bar=True)
-        
-        best_params = study.best_params
-        best_params.update({
-            'objective': 'binary',
-            'metric': 'auc',
-            'boosting_type': 'gbdt',
-            'random_state': self.random_state,
-            'verbosity': -1
-        })
-        
-        print(f"Best LightGBM params: {best_params}")
-        print(f"Best CV score: {study.best_value:.4f}")
-        
-        return best_params
+    # LightGBM methods have been removed from the system
     
     def optimize_xgboost(self, X_train: pd.DataFrame, y_train: pd.Series) -> Dict[str, Any]:
         """Optimize XGBoost hyperparameters"""
@@ -198,45 +144,7 @@ class ModelTrainer:
         
         return best_params
     
-    def train_lightgbm(self, X_train: pd.DataFrame, y_train: pd.Series,
-                       X_val: Optional[pd.DataFrame] = None,
-                       y_val: Optional[pd.Series] = None,
-                       optimize: bool = True) -> lgb.LGBMClassifier:
-        """Train LightGBM model"""
-        print("\nTraining LightGBM...")
-        
-        if optimize:
-            params = self.optimize_lightgbm(X_train, y_train)
-            self.best_params['lightgbm'] = params
-        else:
-            params = {
-                'objective': 'binary',
-                'metric': 'auc',
-                'boosting_type': 'gbdt',
-                'num_leaves': 31,
-                'learning_rate': 0.05,
-                'feature_fraction': 0.9,
-                'bagging_fraction': 0.8,
-                'bagging_freq': 5,
-                'random_state': self.random_state,
-                'verbosity': -1
-            }
-        
-        model = lgb.LGBMClassifier(**params, n_estimators=1000)
-        
-        if X_val is not None and y_val is not None:
-            model.fit(X_train, y_train,
-                     eval_set=[(X_val, y_val)],
-                     callbacks=[lgb.early_stopping(100), lgb.log_evaluation(0)])
-        else:
-            model.fit(X_train, y_train)
-        
-        self.models['lightgbm'] = model
-        self.feature_importance['lightgbm'] = dict(zip(
-            X_train.columns, model.feature_importances_
-        ))
-        
-        return model
+    # LightGBM training method has been removed from the system
     
     def train_xgboost(self, X_train: pd.DataFrame, y_train: pd.Series,
                      X_val: Optional[pd.DataFrame] = None,

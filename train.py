@@ -152,7 +152,7 @@ def main():
         fast_config = config['training'].get('fast', {})
         cv_folds = fast_config.get('cv_folds', 3)
         n_trials = fast_config.get('n_trials', 20)
-        models_to_train = fast_config.get('models', ['lightgbm', 'ensemble'])
+        models_to_train = fast_config.get('models', ['xgboost', 'ensemble'])
         logger.info("FAST MODE: Using reduced settings for quick training")
         logger.info(f"  CV folds: {cv_folds} (reduced from {config['model']['cv_folds']})")
         logger.info(f"  Optimization trials: {n_trials} (reduced from {config['model']['n_trials']})")
@@ -177,9 +177,8 @@ def main():
     
     logger.info(f"Training {len(models_to_train)} model(s): {models_to_train}")
     
-    if 'lightgbm' in models_to_train:
-        logger.info("Training LightGBM...")
-        trainer.train_lightgbm(X_train_processed, y_train, optimize=True)
+    # Note: LightGBM has been removed from the system
+    # Only XGBoost, CatBoost, and Ensemble are available
     
     if 'xgboost' in models_to_train:
         logger.info("Training XGBoost...")

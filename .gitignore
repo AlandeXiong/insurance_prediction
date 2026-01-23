@@ -22,6 +22,10 @@ var/
 wheels/
 share/python-wheels/
 *.egg-info/
+outputs/
+logs/
+models/
+catboost_info/
 .installed.cfg
 *.egg
 MANIFEST
