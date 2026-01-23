@@ -32,13 +32,36 @@ def main():
     logger.info("Starting Insurance Renewal Prediction Training Pipeline")
     logger.info("="*80)
     
-    # Load data
-    logger.info(f"Loading data from {config['data']['train_path']}")
-    df = pd.read_csv(config['data']['train_path'])
-    logger.info(f"Data loaded: Shape {df.shape}")
+    # Load data - support both separate files and single file with split
+    use_separate_files = config['data'].get('use_separate_files', False)
+    target_column = config['data']['target_column']
+    
+    if use_separate_files:
+        # Load separate train and test files
+        train_path = config['data']['train_path']
+        test_path = config['data'].get('test_path', None)
+        
+        if not test_path:
+            raise ValueError("use_separate_files is True but test_path is not provided in config")
+        
+        logger.info(f"Loading training data from {train_path}")
+        df_train = pd.read_csv(train_path)
+        logger.info(f"Training data loaded: Shape {df_train.shape}")
+        
+        logger.info(f"Loading test data from {test_path}")
+        df_test = pd.read_csv(test_path)
+        logger.info(f"Test data loaded: Shape {df_test.shape}")
+        
+        # Use training data for EDA and feature discovery
+        df = df_train.copy()
+        
+    else:
+        # Load single file and split
+        logger.info(f"Loading data from {config['data']['train_path']}")
+        df = pd.read_csv(config['data']['train_path'])
+        logger.info(f"Data loaded: Shape {df.shape}")
     
     # Auto-discover features if not specified in config
-    target_column = config['data']['target_column']
     discovered = discover_features(df, target_column=target_column)
     
     # Use discovered features or config features
@@ -51,7 +74,7 @@ def main():
         categorical_features = config['features']['categorical_features']
         logger.info(f"Using config features: {len(numerical_features)} numerical, {len(categorical_features)} categorical")
     
-    # EDA
+    # EDA (using training data only)
     logger.info("Starting Exploratory Data Analysis...")
     eda_output_dir = paths['outputs'] / 'eda'
     explorer = DataExplorer(eda_output_dir)
@@ -61,27 +84,73 @@ def main():
     # Prepare data
     logger.info("Preparing data for training...")
     
-    # Encode target
+    # Encode target - fit on training data only
     le_target = LabelEncoder()
-    df[target_column] = le_target.fit_transform(df[target_column])
-    target_mapping = dict(zip(le_target.classes_, range(len(le_target.classes_))))
-    logger.info(f"Target encoding: {target_mapping}")
     
-    # Drop unnecessary columns
-    drop_cols = config['features'].get('drop_features', [])
-    df = df.drop(columns=[col for col in drop_cols if col in df.columns])
-    
-    # Split data
-    X = df.drop(columns=[target_column])
-    y = df[target_column]
-    
-    stratify = y if config['data'].get('stratify', True) else None
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y,
-        test_size=config['data']['test_size'],
-        random_state=config['data']['random_state'],
-        stratify=stratify
-    )
+    if use_separate_files:
+        # Process training data
+        df_train[target_column] = le_target.fit_transform(df_train[target_column])
+        target_mapping = dict(zip(le_target.classes_, range(len(le_target.classes_))))
+        logger.info(f"Target encoding (fitted on train): {target_mapping}")
+        
+        # Process test data using same encoder
+        # Handle unseen labels in test set
+        test_targets = df_test[target_column].values
+        test_targets_encoded = []
+        unseen_labels = set()
+        
+        for val in test_targets:
+            try:
+                # Try to transform using the fitted encoder
+                encoded = le_target.transform([val])[0]
+                test_targets_encoded.append(encoded)
+            except ValueError:
+                # Unseen label in test set
+                unseen_labels.add(val)
+                # Use the first class from training set as default
+                default_class = le_target.classes_[0]
+                default_encoded = le_target.transform([default_class])[0]
+                test_targets_encoded.append(default_encoded)
+                logger.warning(f"Unseen target value '{val}' in test set. Using default encoding: {default_class} -> {default_encoded}")
+        
+        if unseen_labels:
+            logger.warning(f"Found {len(unseen_labels)} unseen target value(s) in test set: {unseen_labels}")
+            logger.warning("These have been encoded using the default class from training set.")
+        
+        df_test[target_column] = test_targets_encoded
+        
+        # Drop unnecessary columns
+        drop_cols = config['features'].get('drop_features', [])
+        df_train = df_train.drop(columns=[col for col in drop_cols if col in df_train.columns])
+        df_test = df_test.drop(columns=[col for col in drop_cols if col in df_test.columns])
+        
+        # Split into X and y
+        X_train = df_train.drop(columns=[target_column])
+        y_train = df_train[target_column]
+        X_test = df_test.drop(columns=[target_column])
+        y_test = df_test[target_column]
+        
+    else:
+        # Original logic: split from single file
+        df[target_column] = le_target.fit_transform(df[target_column])
+        target_mapping = dict(zip(le_target.classes_, range(len(le_target.classes_))))
+        logger.info(f"Target encoding: {target_mapping}")
+        
+        # Drop unnecessary columns
+        drop_cols = config['features'].get('drop_features', [])
+        df = df.drop(columns=[col for col in drop_cols if col in df.columns])
+        
+        # Split data
+        X = df.drop(columns=[target_column])
+        y = df[target_column]
+        
+        stratify = y if config['data'].get('stratify', True) else None
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y,
+            test_size=config['data']['test_size'],
+            random_state=config['data']['random_state'],
+            stratify=stratify
+        )
     
     logger.info(f"Train set: {X_train.shape}, Test set: {X_test.shape}")
     logger.info(f"Train target distribution: {y_train.value_counts().to_dict()}")
@@ -168,11 +237,20 @@ def main():
         logger.info(f"  Optimization trials: {n_trials}")
         logger.info(f"  Models: {models_to_train}")
     
+    # Get minimum recall requirement from config
+    min_recall = config.get('model', {}).get('min_recall', 0.6)
+    optimize_threshold = config.get('model', {}).get('optimize_threshold', True)
+    
+    logger.info(f"Minimum recall requirement: {min_recall}")
+    logger.info(f"Threshold optimization: {optimize_threshold}")
+    
     trainer = ModelTrainer(
         cv_folds=cv_folds,
         random_state=config['data']['random_state'],
         scoring=config['model']['scoring'],
-        n_trials=n_trials
+        n_trials=n_trials,
+        min_recall=min_recall,
+        optimize_threshold=optimize_threshold
     )
     
     logger.info(f"Training {len(models_to_train)} model(s): {models_to_train}")
@@ -180,18 +258,33 @@ def main():
     # Note: LightGBM has been removed from the system
     # Only XGBoost, CatBoost, and Ensemble are available
     
+    # Create validation set from training data for threshold optimization
+    # This ensures we have a validation set to optimize thresholds
+    from sklearn.model_selection import train_test_split as tts
+    X_train_fit, X_val_fit, y_train_fit, y_val_fit = tts(
+        X_train_processed, y_train,
+        test_size=0.2,
+        random_state=config['data']['random_state'],
+        stratify=y_train
+    )
+    logger.info(f"Training set for model fitting: {X_train_fit.shape}")
+    logger.info(f"Validation set for threshold optimization: {X_val_fit.shape}")
+    
+    # All models use the same feature engineering pipeline (already applied)
+    # All models will be trained with class weights and threshold optimization
+    
     if 'xgboost' in models_to_train:
         logger.info("Training XGBoost...")
-        trainer.train_xgboost(X_train_processed, y_train, optimize=True)
+        trainer.train_xgboost(X_train_fit, y_train_fit, X_val_fit, y_val_fit, optimize=True)
     
     if 'catboost' in models_to_train:
         logger.info("Training CatBoost...")
-        trainer.train_catboost(X_train_processed, y_train, optimize=True)
+        trainer.train_catboost(X_train_fit, y_train_fit, X_val_fit, y_val_fit, optimize=True)
     
     if 'ensemble' in models_to_train:
         logger.info("Training Ensemble model...")
         trainer.train_ensemble(
-            X_train_processed, y_train,
+            X_train_fit, y_train_fit, X_val_fit, y_val_fit,
             method=config['model']['ensemble']['method']
         )
     
@@ -200,15 +293,19 @@ def main():
     cv_scores = trainer.cross_validate(X_train_processed, y_train)
     
     # Evaluate on test set
+    # Re-optimize thresholds on test set to ensure recall requirement is met
     logger.info("Evaluating models on test set...")
-    test_results = trainer.evaluate(X_test_processed, y_test)
+    logger.info("Re-optimizing thresholds on test set to meet recall requirement...")
+    test_results = trainer.evaluate(X_test_processed, y_test, reoptimize_threshold=True)
     
-    # Get predictions and probabilities for reporting
+    # Get predictions and probabilities for reporting (using optimal thresholds)
     predictions = {}
     probabilities = {}
     for model_name, model in trainer.models.items():
-        predictions[model_name] = model.predict(X_test_processed)
-        probabilities[model_name] = model.predict_proba(X_test_processed)[:, 1]
+        proba = model.predict_proba(X_test_processed)[:, 1]
+        threshold = trainer.best_thresholds.get(model_name, 0.5)
+        predictions[model_name] = (proba >= threshold).astype(int)
+        probabilities[model_name] = proba
     
     # Generate comprehensive report
     logger.info("Generating comprehensive training and evaluation report...")

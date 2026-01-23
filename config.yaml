@@ -1,11 +1,18 @@
 # Configuration file for Insurance Renewal Prediction
 
 data:
-  train_path: "dataset/WA_Fn-UseC_-Marketing-Customer-Value-Analysis.csv"
+  # Paths for separate train and test files
+  train_path: "dataset/WA_Fn-UseC_-Marketing-Customer-Value-Analysis—train.csv"
+  test_path: "dataset/WA_Fn-UseC_-Marketing-Customer-Value-Analysis—test.csv"
+  
+  # If train_path and test_path are provided, they will be used
+  # Otherwise, single file will be split using test_size
+  use_separate_files: true  # Set to true to use separate train/test files
+  
   target_column: "Response"
-  test_size: 0.2
+  test_size: 0.2  # Only used if use_separate_files is false
   random_state: 42
-  stratify: true
+  stratify: true  # Only used if use_separate_files is false
 
 features:
   # Set to true to auto-discover features from data
@@ -52,8 +59,12 @@ model:
     - "ensemble"
   
   cv_folds: 5
-  scoring: "roc_auc"
+  scoring: "f1"  # Changed to F1 to balance precision and recall
   n_trials: 100
+  
+  # Class imbalance handling
+  min_recall: 0.6  # Minimum recall requirement (must be >= 0.6)
+  optimize_threshold: true  # Optimize threshold to meet recall requirement
   
   ensemble:
     method: "voting"  # voting or stacking
