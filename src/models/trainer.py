@@ -402,6 +402,27 @@ class ModelTrainer:
                     oof_proba[val_idx] = model.predict_proba(X_val)[:, 1]
                     fold_artifacts.append({"fe": fe, "model": model})
 
+                elif name == "lightgbm":
+                    params = dict(self.best_params.get("lightgbm", self._lgbm_default_params()))
+                    cw = self.compute_class_weights(y_tr)
+                    scale_pos_weight = cw.get(1, 1.0) / cw.get(0, 1.0) if 0 in cw and 1 in cw else 1.0
+                    params.setdefault("objective", "binary")
+                    params.setdefault("metric", "auc")
+                    params.setdefault("random_state", self.random_state)
+                    params.setdefault("n_jobs", -1)
+                    params.setdefault("verbosity", -1)
+                    params.setdefault("scale_pos_weight", scale_pos_weight)
+
+                    model = lgb.LGBMClassifier(**params, n_estimators=5000)
+                    model.fit(
+                        X_tr,
+                        y_tr,
+                        eval_set=[(X_val, y.iloc[val_idx])],
+                        callbacks=[lgb.early_stopping(stopping_rounds=100, verbose=False)],
+                    )
+                    oof_proba[val_idx] = model.predict_proba(X_val)[:, 1]
+                    fold_artifacts.append({"fe": fe, "model": model})
+
                 elif name == "catboost":
                     params = dict(self.best_params.get("catboost", default_cat_params))
                     cw = self.compute_class_weights(y_tr)
@@ -434,7 +455,12 @@ class ModelTrainer:
                         params_lgb.setdefault("verbosity", -1)
                         params_lgb.setdefault("scale_pos_weight", scale_pos_weight)
                         m_lgb = lgb.LGBMClassifier(**params_lgb, n_estimators=5000)
-                        m_lgb.fit(X_tr, y_tr)
+                        m_lgb.fit(
+                            X_tr,
+                            y_tr,
+                            eval_set=[(X_val, y.iloc[val_idx])],
+                            callbacks=[lgb.early_stopping(stopping_rounds=100, verbose=False)],
+                        )
                         fold_probas.append(m_lgb.predict_proba(X_val)[:, 1])
                         models_dict["lgb"] = m_lgb
 
@@ -463,7 +489,7 @@ class ModelTrainer:
                         fold_probas.append(m_cat.predict_proba(X_val)[:, 1])
                         models_dict["cat"] = m_cat
 
-                    oof_proba[val_idx] = float(np.mean(np.vstack(fold_probas), axis=0)) if len(fold_probas) == 1 else np.mean(np.vstack(fold_probas), axis=0)
+                    oof_proba[val_idx] = np.mean(np.vstack(fold_probas), axis=0)
                     fold_artifacts.append({"fe": fe, "models": models_dict})
 
                 else:
@@ -572,6 +598,23 @@ class ModelTrainer:
                     m.fit(X_tr, y_tr)
                     proba = m.predict_proba(X_val)[:, 1]
 
+                elif name == "lightgbm":
+                    params = dict(self.best_params.get("lightgbm", self._lgbm_default_params()))
+                    params.setdefault("objective", "binary")
+                    params.setdefault("metric", "auc")
+                    params.setdefault("random_state", self.random_state)
+                    params.setdefault("n_jobs", -1)
+                    params.setdefault("verbosity", -1)
+                    params.setdefault("scale_pos_weight", scale_pos_weight)
+                    m = lgb.LGBMClassifier(**params, n_estimators=5000)
+                    m.fit(
+                        X_tr,
+                        y_tr,
+                        eval_set=[(X_val, y_val)],
+                        callbacks=[lgb.early_stopping(stopping_rounds=100, verbose=False)],
+                    )
+                    proba = m.predict_proba(X_val)[:, 1]
+
                 elif name == "catboost":
                     params = dict(default_cat_params)
                     params.setdefault("class_weights", [cw.get(0, 1.0), cw.get(1, 1.0)])
@@ -581,20 +624,43 @@ class ModelTrainer:
                     proba = m.predict_proba(X_val)[:, 1]
 
                 elif name == "ensemble":
-                    params_xgb = dict(default_xgb_params)
-                    params_xgb.setdefault("scale_pos_weight", scale_pos_weight)
-                    m_xgb = xgb.XGBClassifier(**params_xgb, n_estimators=1000)
-                    m_xgb.fit(X_tr, y_tr)
-                    p_xgb = m_xgb.predict_proba(X_val)[:, 1]
+                    # Use the same base model set as the trained ensemble (if available)
+                    base_models = list(self.ensemble_base_models) if self.ensemble_base_models else ["lgb", "xgb", "cat"]
+                    probs = []
 
-                    params_cat = dict(default_cat_params)
-                    params_cat.setdefault("class_weights", [cw.get(0, 1.0), cw.get(1, 1.0)])
-                    m_cat = CatBoostClassifier(**params_cat)
-                    cat_features = self._cat_feature_indices(X_tr, cat_feature_names)
-                    m_cat.fit(X_tr, y_tr, cat_features=cat_features, verbose=False)
-                    p_cat = m_cat.predict_proba(X_val)[:, 1]
+                    if "lgb" in base_models:
+                        params_lgb = dict(self.best_params.get("lightgbm", self._lgbm_default_params()))
+                        params_lgb.setdefault("objective", "binary")
+                        params_lgb.setdefault("metric", "auc")
+                        params_lgb.setdefault("random_state", self.random_state)
+                        params_lgb.setdefault("n_jobs", -1)
+                        params_lgb.setdefault("verbosity", -1)
+                        params_lgb.setdefault("scale_pos_weight", scale_pos_weight)
+                        m_lgb = lgb.LGBMClassifier(**params_lgb, n_estimators=5000)
+                        m_lgb.fit(
+                            X_tr,
+                            y_tr,
+                            eval_set=[(X_val, y_val)],
+                            callbacks=[lgb.early_stopping(stopping_rounds=100, verbose=False)],
+                        )
+                        probs.append(m_lgb.predict_proba(X_val)[:, 1])
 
-                    proba = (p_xgb + p_cat) / 2.0
+                    if "xgb" in base_models:
+                        params_xgb = dict(default_xgb_params)
+                        params_xgb.setdefault("scale_pos_weight", scale_pos_weight)
+                        m_xgb = xgb.XGBClassifier(**params_xgb, n_estimators=1000)
+                        m_xgb.fit(X_tr, y_tr)
+                        probs.append(m_xgb.predict_proba(X_val)[:, 1])
+
+                    if "cat" in base_models:
+                        params_cat = dict(default_cat_params)
+                        params_cat.setdefault("class_weights", [cw.get(0, 1.0), cw.get(1, 1.0)])
+                        m_cat = CatBoostClassifier(**params_cat)
+                        cat_features = self._cat_feature_indices(X_tr, cat_feature_names)
+                        m_cat.fit(X_tr, y_tr, cat_features=cat_features, verbose=False)
+                        probs.append(m_cat.predict_proba(X_val)[:, 1])
+
+                    proba = np.mean(np.vstack(probs), axis=0)
                 else:
                     continue
 
