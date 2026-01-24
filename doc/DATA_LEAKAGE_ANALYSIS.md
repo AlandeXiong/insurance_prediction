@@ -2,13 +2,16 @@
 
 ## Problem Identified
 
-The code has a **critical data leakage issue** in target encoding that can cause AUC to be artificially high (close to 1).
+Historically, the code had a **critical data leakage issue** in target encoding that could cause AUC
+to be artificially high (close to 1).
+
+✅ Current status: target encoding is **not used** in the current pipeline.
 
 ## Root Cause
 
-### Issue 1: Target Encoding Without Proper Cross-Validation
+### Issue 1 (historical): Target Encoding Without Proper Cross-Validation
 
-In `src/features/engineering.py`, the `create_statistical_features` method performs target encoding:
+In older versions, `create_statistical_features` performed target encoding:
 
 ```python
 if fit and self.target_column in df.columns:
@@ -46,16 +49,18 @@ for train_idx, val_idx in cv.split(X_train, y_train):
 2. **Perfect Feature**: Target-encoded features become perfect predictors because they directly encode the target distribution
 3. **Overfitting**: The model memorizes the training data patterns instead of learning generalizable patterns
 
-## Solution
+## Solution (current approach)
 
-We need to implement **cross-validation safe target encoding** (also called "leave-one-out" or "out-of-fold" encoding).
+We do NOT use target encoding. Instead we:
+- fit feature engineering per fold for CV/OOF routines
+- use leakage-safe encodings (count/frequency + group aggregations on numeric features)
 
 ### Fix Strategy
 
-1. **Modify FeatureEngineer to accept target separately**
-2. **Implement CV-safe target encoding** that excludes the current sample when calculating means
-3. **Update training pipeline** to pass target variable correctly
-4. **Add data leakage detection** utilities
+1. Fit feature engineering per fold during CV/OOF
+2. Use leakage-safe statistical features (no target)
+3. Keep explicit separation between features and target
+4. Keep leakage detection utilities
 
 ## Implementation
 

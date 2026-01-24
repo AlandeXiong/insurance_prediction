@@ -2,13 +2,18 @@
 
 ## Problem: AUC Still > 0.99
 
-Even after disabling target encoding, AUC may still be > 0.99. Here are all possible causes and fixes:
+If you see AUC > 0.99, it usually indicates **data leakage** or a train/test contamination issue.
+
+⚠️ Note: **Target encoding is no longer used in the current pipeline.** It was removed because it is
+easy to leak without strict out-of-fold encoding. The pipeline uses leakage-safe alternatives:
+count/frequency encodings and group aggregations (median/mean/std) on numeric features.
 
 ## Root Causes
 
-### 1. Old Saved Models with Target Encoding
+### 1. Old Saved Models / Feature Engineer Artifacts
 
-**Problem**: Previously saved feature engineer may have target encoding enabled.
+**Problem**: Old saved `feature_engineer.pkl` / model artifacts may not match the current codebase,
+and can cause confusing behavior.
 
 **Solution**:
 ```bash
@@ -16,14 +21,6 @@ Even after disabling target encoding, AUC may still be > 0.99. Here are all poss
 rm -rf models/*.pkl
 rm -rf models/feature_engineer.pkl
 ```
-
-### 2. Target Encoding Maps Still Being Used
-
-**Problem**: Even with `use_target_encoding=False`, old maps might be loaded and used.
-
-**Fix Applied**: 
-- Modified `create_statistical_features()` to only use target encoding maps if `use_target_encoding=True`
-- Clear target encoding maps when disabled
 
 ### 3. Features Directly Containing Target Information
 
@@ -54,15 +51,7 @@ rm -rf models/*.pkl
 rm -rf models/feature_engineer.pkl
 ```
 
-### Step 2: Verify Config
-
-Check `config.yaml`:
-```yaml
-features:
-  use_target_encoding: false  # MUST be false
-```
-
-### Step 3: Run Diagnostic
+### Step 2: Run Diagnostic
 
 ```bash
 python diagnose_leakage.py
@@ -75,39 +64,25 @@ This will check:
 - Configuration settings
 - Data quality issues
 
-### Step 4: Re-train from Scratch
+### Step 3: Re-train from Scratch
 
 ```bash
 python train.py
 ```
 
-### Step 5: Verify Results
+### Step 4: Verify Results
 
 After training, check:
 - AUC should be 0.75-0.85 (realistic)
 - CV score ≈ test score (no large gap)
-- Feature importance doesn't show target-encoded features
+- Feature importance doesn't show suspiciously-perfect predictors
 
 ## Code Changes Made
 
 ### 1. Feature Engineering (`src/features/engineering.py`)
 
-**Change**: Only use target encoding maps if explicitly enabled
-```python
-# Before: Would use maps even if disabled
-elif hasattr(self, 'target_encoding_maps') and cat_col in self.target_encoding_maps:
-
-# After: Only use if enabled
-elif self.use_target_encoding and hasattr(self, 'target_encoding_maps') and cat_col in self.target_encoding_maps:
-```
-
-### 2. Clear Maps When Disabled
-
-**Change**: Clear target encoding maps when disabled
-```python
-if not self.use_target_encoding:
-    self.target_encoding_maps = {}  # Keep empty
-```
+**Change**: Target encoding logic was removed from the pipeline to eliminate leakage risk.
+Legacy keys may still exist in saved artifacts for backward compatibility but are not used.
 
 ## Expected Results
 
@@ -126,18 +101,17 @@ if not self.use_target_encoding:
 ## Verification Checklist
 
 - [ ] Deleted old models (`models/*.pkl`)
-- [ ] Config has `use_target_encoding: false`
 - [ ] Ran diagnostic script (no critical issues)
 - [ ] Re-trained from scratch
 - [ ] AUC is 0.75-0.85 (not 0.99+)
 - [ ] CV score ≈ test score
-- [ ] No target-encoded features in top importance
+- [ ] No suspiciously-perfect predictors in top importance
 
 ## If AUC Still > 0.99
 
 1. **Check feature importance**:
    ```python
-   # Should NOT see features ending with _Target_Mean
+   # Should NOT see suspiciously-perfect predictors
    ```
 
 2. **Check correlations**:
@@ -152,12 +126,11 @@ if not self.use_target_encoding:
    - Verify no future information leakage
 
 4. **Check logs**:
-   - Should see "Target encoding is DISABLED"
-   - Should NOT see "WARNING: Target encoding enabled"
+   - CV metrics should be close to test metrics (no huge gap)
 
 ## Additional Notes
 
-- Target encoding is **completely disabled** by default
-- Old saved models may still have target encoding - delete them
+- Target encoding is **not used** in the current pipeline
+- Old saved models may still contain legacy keys - delete them before re-training
 - Diagnostic script helps identify all leakage sources
 - Realistic AUC for this dataset: 0.75-0.85

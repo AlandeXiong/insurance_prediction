@@ -1,8 +1,12 @@
-# Detailed Data Leakage Analysis - AUC > 0.99
+# Detailed Data Leakage Analysis - AUC > 0.99 (Historical)
 
-## Root Cause Identified
+## Root Cause Identified (historical)
 
-The AUC > 0.99 is caused by **target encoding data leakage** in cross-validation. Here's the detailed analysis:
+Historically, AUC > 0.99 was caused by **target encoding leakage** combined with feature engineering
+being fit on the full training set before CV.
+
+✅ Current status: Target encoding is **not used** in the current pipeline, and CV/OOF procedures
+fit feature engineering **per fold** to avoid leakage.
 
 ## Problem 1: Target Encoding in Cross-Validation
 
@@ -65,32 +69,19 @@ X_val[cat_col + '_Target_Mean'] = X_val[cat_col].map(target_mean)
 
 This is still safe IF we only use X_tr for encoding. But if we accidentally use X_val's target, it leaks.
 
-## Solution Implemented
+## Solution Implemented (current)
 
-### 1. Disable Target Encoding by Default
+### 1. Remove Target Encoding From the Pipeline
 
-**Changed**: Target encoding is now **DISABLED by default** to prevent data leakage.
+**Changed**: Target encoding is no longer part of `FeatureEngineer`.
 
-```python
-def __init__(self, ..., use_target_encoding: bool = False):
-    self.use_target_encoding = use_target_encoding  # Disabled by default
-```
-
-### 2. Clear Warnings
-
-Added warnings when target encoding is used:
-```python
-if self.use_target_encoding and fit and y is not None:
-    print(f"WARNING: Target encoding enabled. Ensure out-of-fold encoding in CV!")
-```
-
-### 3. Safe Features Only
+### 2. Safe Features Only
 
 Now using only safe features:
 - ✅ Count encoding (no target used)
-- ✅ Median encoding (no target used)
+- ✅ Group aggregations on numeric features (median/mean/std)
 - ✅ Interaction features (no target used)
-- ❌ Target encoding (DISABLED)
+- ❌ Target encoding (REMOVED)
 
 ## Expected Results After Fix
 
@@ -124,7 +115,7 @@ Now using only safe features:
    # If correlation is 0.95+, there's leakage
    ```
 
-## How to Safely Use Target Encoding (Future)
+## How to Safely Use Target Encoding (If you re-introduce it)
 
 If you want to use target encoding properly, you need:
 
@@ -147,7 +138,7 @@ If you want to use target encoding properly, you need:
 
 ## Current Status
 
-✅ **Target encoding DISABLED** - No data leakage
+✅ **Target encoding removed** - No data leakage from target encoding
 ✅ **Safe features only** - Count encoding, median encoding, interactions
 ✅ **Realistic AUC expected** - 0.75-0.85 range
 

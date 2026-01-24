@@ -2,7 +2,11 @@
 
 ## Problem Identified
 
-The original implementation had a **critical data leakage risk** in target encoding:
+The original implementation had a **critical data leakage risk** related to target encoding.
+
+✅ Current status: **Target encoding is NOT used in the current pipeline**. It was removed to
+avoid accidental leakage. The system uses leakage-safe alternatives (count/frequency + group
+aggregations) and fits feature engineering per fold in CV/OOF routines.
 
 1. **Issue**: The `transform()` method was checking if target column exists in the dataframe (`if self.target_column in df.columns`), but during training, `X_train` doesn't contain the target column.
 
@@ -22,20 +26,20 @@ if fit and self.target_column in df.columns:
     target_mean = df.groupby(cat_col)[self.target_column].mean()
 ```
 
-**After (SAFE):**
+**After (SAFE / current approach):**
 ```python
-# Target encoding now requires y to be passed separately
+# Feature engineering can accept y separately (for future safe extensions),
+# but target encoding is not part of the current pipeline.
 def transform(self, df: pd.DataFrame, y: pd.Series = None, fit: bool = True):
-    # y is passed separately, ensuring only training data is used
     if fit and y is not None:
-        target_mean = pd.Series(y.values, index=df.index).groupby(df[cat_col]).mean()
+        # safe features can be fit here (scaler, group aggregates, etc.)
+        pass
 ```
 
 ### 2. Safety Checks Added
 
 - **Automatic target removal**: If target column is accidentally included in features, it's automatically removed
-- **Warning messages**: Clear warnings when target encoding is skipped due to missing y
-- **Explicit separation**: Target must be passed as separate parameter, making data flow explicit
+- **Explicit separation**: Target can be passed as a separate parameter, making data flow explicit
 
 ### 3. Training Pipeline Updated
 
@@ -57,10 +61,8 @@ X_test_processed = feature_engineer.transform(X_test, fit=False)
 ### `src/features/engineering.py`
 
 1. **`create_statistical_features()` method**:
-   - Now accepts `y: pd.Series` parameter
-   - Only uses `y` when `fit=True` (training)
-   - Uses stored mappings when `fit=False` (prediction)
-   - Added safety warnings
+   - Uses leakage-safe statistical features only (count/frequency + group aggregations)
+   - Does NOT perform target encoding
 
 2. **`transform()` method**:
    - Now accepts `y: pd.Series` parameter

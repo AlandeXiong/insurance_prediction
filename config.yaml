@@ -17,12 +17,7 @@ data:
 features:
   # Set to true to auto-discover features from data
   use_auto_discovery: false
-  
-  # WARNING: Target encoding causes data leakage in cross-validation!
-  # It will lead to unrealistic AUC > 0.99. Keep it disabled unless you implement
-  # proper out-of-fold encoding in CV.
-  use_target_encoding: false  # DISABLED by default to prevent data leakage
-  
+
   categorical_features:
     - "State"
     - "Coverage"
@@ -65,9 +60,18 @@ model:
   
   # Business constraints for imbalanced classification (threshold moving)
   # Goal: ensure Recall >= min_recall AND Precision >= min_precision
-  min_recall: 0.5
-  min_precision: 0.3
+  # Business target: keep recall high (dataset positive ratio ~0.15),
+  # then maximize precision under that recall constraint.
+  min_recall: 0.6
+  min_precision: 0.25
   optimize_threshold: true  # Optimize threshold to meet recall requirement
+  # Threshold selection policy under constraints:
+  # - max_precision: maximize precision (can yield very high thresholds and unstable recall on test)
+  # - max_recall: maximize recall under precision constraint (recommended when recall is critical)
+  # If your test recall is still too low (common when test probabilities are less calibrated/lower),
+  # use the more aggressive recall-first strategy below.
+  # For "maximize precision under recall>=min_recall", use:
+  threshold_selection: "max_precision"
   
   ensemble:
     method: "voting"  # voting or stacking
@@ -83,7 +87,7 @@ training:
   fast:
     n_trials: 20  # Reduced optimization trials
     cv_folds: 3  # Fewer CV folds
-    models: ["lightgbm", "xgboost", "ensemble"]  # Fewer models to train
+    models: ["lightgbm", "xgboost", "catboost", "ensemble"]  # Fewer models to train
   
   # Full mode settings (used when mode="full")
   full:

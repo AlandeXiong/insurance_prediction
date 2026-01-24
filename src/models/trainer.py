@@ -7,9 +7,12 @@ from sklearn.metrics import (
     recall_score, f1_score, classification_report, confusion_matrix,
     precision_recall_curve, fbeta_score
 )
-import lightgbm as lgb
 import xgboost as xgb
-from catboost import CatBoostClassifier
+
+try:
+    from catboost import CatBoostClassifier
+except ImportError:  # pragma: no cover
+    CatBoostClassifier = None
 from sklearn.ensemble import VotingClassifier
 from sklearn.utils.class_weight import compute_class_weight
 import optuna
@@ -18,6 +21,11 @@ from pathlib import Path
 from typing import Dict, List, Any, Tuple, Optional
 import warnings
 warnings.filterwarnings('ignore')
+
+try:
+    import lightgbm as lgb
+except ImportError:  # pragma: no cover
+    lgb = None
 
 
 class ModelTrainer:
@@ -29,7 +37,8 @@ class ModelTrainer:
     def __init__(self, cv_folds: int = 5, random_state: int = 42, 
                  scoring: str = 'roc_auc', n_trials: int = 100,
                  min_recall: float = 0.6, min_precision: float = 0.3,
-                 optimize_threshold: bool = True):
+                 optimize_threshold: bool = True,
+                 threshold_selection: str = "max_precision"):
         """
         Initialize model trainer.
         
@@ -41,6 +50,9 @@ class ModelTrainer:
             min_recall: Minimum recall requirement (default 0.6)
             min_precision: Minimum precision requirement (default 0.3)
             optimize_threshold: Whether to optimize prediction threshold
+            threshold_selection: Threshold selection strategy under constraints.
+                - "max_precision": maximize precision (may push threshold high)
+                - "max_recall": maximize recall under precision constraint (recall-first, more robust)
         """
         self.cv_folds = cv_folds
         self.random_state = random_state
@@ -49,6 +61,7 @@ class ModelTrainer:
         self.min_recall = min_recall
         self.min_precision = min_precision
         self.optimize_threshold = optimize_threshold
+        self.threshold_selection = threshold_selection
         
         self.models = {}
         self.best_params = {}
@@ -99,6 +112,11 @@ class ModelTrainer:
         Optimize LightGBM hyperparameters with class imbalance handling.
         Optimizes precision under constraints: recall >= min_recall AND precision >= min_precision.
         """
+        if lgb is None:  # pragma: no cover
+            raise ImportError(
+                "lightgbm is not installed. Install it (e.g., `pip install lightgbm`) "
+                "or remove 'lightgbm' from config.yaml model lists."
+            )
         print("\nOptimizing LightGBM...")
 
         class_weights = self.compute_class_weights(y_train)
@@ -142,7 +160,9 @@ class ModelTrainer:
                     min_recall=self.min_recall,
                     min_precision=self.min_precision,
                 )
-                score = metrics["precision"] if (metrics["recall"] >= self.min_recall and metrics["precision"] >= self.min_precision) else 0.0
+                # Optimization score: maximize precision subject to recall >= min_recall.
+                # Do NOT hard-gate by min_precision here; otherwise many runs become all-zeros and Optuna/CV can't learn.
+                score = metrics["precision"] if (metrics["recall"] >= self.min_recall) else 0.0
                 scores.append(score)
 
             return float(np.mean(scores))
@@ -178,6 +198,11 @@ class ModelTrainer:
         Train LightGBM model with class imbalance handling.
         Uses the same feature pipeline as other models (expects engineered numeric matrix).
         """
+        if lgb is None:  # pragma: no cover
+            raise ImportError(
+                "lightgbm is not installed. Install it (e.g., `pip install lightgbm`) "
+                "or remove 'lightgbm' from config.yaml model lists."
+            )
         print("\nTraining LightGBM...")
 
         class_weights = self.compute_class_weights(y_train)
@@ -292,7 +317,7 @@ class ModelTrainer:
                         est_params = est_model.get_params()
                         est_copy = est_type(**est_params)
 
-                        if isinstance(est_copy, CatBoostClassifier):
+                        if CatBoostClassifier is not None and isinstance(est_copy, CatBoostClassifier):
                             cat_features = self._cat_feature_indices(X_tr, cat_feature_names)
                             est_copy.fit(X_tr, y_tr, cat_features=cat_features, verbose=False)
                         else:
@@ -305,7 +330,7 @@ class ModelTrainer:
                     from sklearn.base import clone
 
                     model_copy = clone(model)
-                    if isinstance(model_copy, CatBoostClassifier):
+                    if CatBoostClassifier is not None and isinstance(model_copy, CatBoostClassifier):
                         cat_features = self._cat_feature_indices(X_tr, cat_feature_names)
                         model_copy.fit(X_tr, y_tr, cat_features=cat_features, verbose=False)
                     else:
@@ -670,7 +695,8 @@ class ModelTrainer:
                     min_recall=self.min_recall,
                     min_precision=self.min_precision,
                 )
-                score = metrics["precision"] if (metrics["recall"] >= self.min_recall and metrics["precision"] >= self.min_precision) else 0.0
+                # Optimization score: maximize precision subject to recall >= min_recall.
+                score = metrics["precision"] if (metrics["recall"] >= self.min_recall) else 0.0
                 fold_scores.append(float(score))
 
             cv_scores[name] = np.array(fold_scores, dtype=float)
@@ -683,7 +709,10 @@ class ModelTrainer:
         Find an operating threshold that satisfies constraints and optimizes the business goal.
 
         Primary objective:
-        - maximize precision subject to recall >= min_recall and precision >= min_precision
+        - select a threshold under constraints (recall >= min_recall AND precision >= min_precision)
+        - then apply a selection policy:
+            * max_precision (default): maximize precision (can produce very high thresholds)
+            * max_recall: maximize recall (more conservative / recall-first)
 
         Notes on sklearn's `precision_recall_curve` output:
         - precision/recall arrays have length = len(thresholds) + 1
@@ -719,19 +748,32 @@ class ModelTrainer:
         # Feasible set: satisfy BOTH constraints
         feasible = np.where((candidates_r >= min_recall) & (candidates_p >= min_precision))[0]
         if feasible.size > 0:
-            # Max precision, tie-break by higher recall
-            best_idx = feasible[np.lexsort((candidates_r[feasible], candidates_p[feasible]))][-1]
+            if self.threshold_selection == "max_recall":
+                # Recall-first + robustness against score calibration shift:
+                # pick the LOWEST feasible threshold (typically yields the highest/most stable recall on unseen data)
+                # while still satisfying both constraints.
+                best_idx = feasible[int(np.argmin(candidates_t[feasible]))]
+            else:
+                # Max precision, tie-break by higher recall (precision-first)
+                best_idx = feasible[np.lexsort((candidates_r[feasible], candidates_p[feasible]))][-1]
         else:
             # Fallbacks (still deterministic and recall-friendly)
             feasible_recall = np.where(candidates_r >= min_recall)[0]
             feasible_precision = np.where(candidates_p >= min_precision)[0]
 
             if feasible_recall.size > 0:
-                # Max precision under recall constraint
-                best_idx = feasible_recall[np.argmax(candidates_p[feasible_recall])]
+                # Under recall constraint, choose by strategy
+                if self.threshold_selection == "max_recall":
+                    # Lowest threshold among those that meet recall (maximize recall stability)
+                    best_idx = feasible_recall[int(np.argmin(candidates_t[feasible_recall]))]
+                else:
+                    best_idx = feasible_recall[np.argmax(candidates_p[feasible_recall])]
             elif feasible_precision.size > 0:
                 # Max recall under precision constraint
-                best_idx = feasible_precision[np.argmax(candidates_r[feasible_precision])]
+                if self.threshold_selection == "max_recall":
+                    best_idx = feasible_precision[int(np.argmin(candidates_t[feasible_precision]))]
+                else:
+                    best_idx = feasible_precision[np.argmax(candidates_r[feasible_precision])]
             else:
                 # Nothing meets constraints: maximize F2 (recall-weighted) as best-effort
                 beta2 = 2.0
@@ -804,7 +846,8 @@ class ModelTrainer:
                 )
 
                 # Primary objective: maximize precision while meeting recall constraint
-                score = metrics['precision'] if (metrics['recall'] >= self.min_recall and metrics['precision'] >= self.min_precision) else 0.0
+                # Optimization score: maximize precision subject to recall >= min_recall.
+                score = metrics['precision'] if (metrics['recall'] >= self.min_recall) else 0.0
                 scores.append(score)
             
             return np.mean(scores)
@@ -877,7 +920,8 @@ class ModelTrainer:
                 )
 
                 # Primary objective: maximize precision while meeting recall constraint
-                score = metrics['precision'] if (metrics['recall'] >= self.min_recall and metrics['precision'] >= self.min_precision) else 0.0
+                # Optimization score: maximize precision subject to recall >= min_recall.
+                score = metrics['precision'] if (metrics['recall'] >= self.min_recall) else 0.0
                 scores.append(score)
             
             return np.mean(scores)
@@ -1220,7 +1264,8 @@ class ModelTrainer:
                 y_pred = (y_pred_proba >= best_threshold).astype(int)
 
                 # CV score is precision under the recall constraint (primary business goal)
-                score = metrics['precision'] if (metrics['recall'] >= self.min_recall and metrics['precision'] >= self.min_precision) else 0.0
+                # Optimization score: maximize precision subject to recall >= min_recall.
+                score = metrics['precision'] if (metrics['recall'] >= self.min_recall) else 0.0
                 scores.append(score)
             
             cv_scores[name] = np.array(scores)

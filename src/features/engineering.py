@@ -11,15 +11,16 @@ class FeatureEngineer:
     """
     Advanced feature engineering for insurance renewal prediction.
     Follows Kaggle competition best practices for feature creation and transformation.
-    
-    IMPORTANT: Target encoding is disabled by default to prevent data leakage.
-    Enable it only if you implement proper out-of-fold encoding in cross-validation.
+
+    IMPORTANT:
+    - This project does NOT use target encoding in the main pipeline.
+    - Target encoding can easily introduce leakage unless implemented as strict out-of-fold encoding.
+    - We use leakage-safe alternatives (count/frequency + group aggregations on numeric features).
     """
     
     def __init__(self, categorical_features: List[str], 
                  numerical_features: List[str],
-                 target_column: str = "Response",
-                 use_target_encoding: bool = False):
+                 target_column: str = "Response"):
         """
         Initialize feature engineer.
         
@@ -27,22 +28,35 @@ class FeatureEngineer:
             categorical_features: List of categorical feature names
             numerical_features: List of numerical feature names
             target_column: Name of target column
-            use_target_encoding: Whether to use target encoding (DISABLED by default to prevent leakage)
         """
         self.categorical_features = categorical_features
         self.numerical_features = numerical_features
         self.target_column = target_column
-        self.use_target_encoding = use_target_encoding  # Disabled by default
         
         # Encoders and transformers
         self.label_encoders = {}
         self.scaler = StandardScaler()
         self.feature_order = None  # Store feature order for prediction consistency
+
+        # Fitted artifacts for leakage-safe preprocessing
+        # These are learned ONLY when fit=True and reused when fit=False.
+        self.train_size_ = None
+        self.numeric_fill_values_ = {}      # median per numerical feature
+        self.categorical_fill_values_ = {}  # mode per categorical feature
+        self.global_num_medians_ = {}       # fallback medians for unseen categories in aggregations
+        self.global_num_means_ = {}         # fallback means for unseen categories in aggregations
         
         # Statistical encoding maps
+        # Deprecated legacy field kept for backward compatibility when loading old artifacts.
+        # Target encoding is not used in the current pipeline.
         self.target_encoding_maps = {}
         self.count_encoding_maps = {}
         self.median_encoding_maps = {}
+        self.mean_encoding_maps = {}
+        self.std_encoding_maps = {}
+
+        # Date feature reference (optional)
+        self.effective_date_ref_ = None
         
     def create_interaction_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -77,6 +91,12 @@ class FeatureEngineer:
             df['CLV_Income_Ratio'] = df['Customer Lifetime Value'] / (df['Income'] + 1)
             df['CLV_Log'] = np.log1p(df['Customer Lifetime Value'])
             df['Income_Log'] = np.log1p(df['Income'])
+
+        # Additional log transforms for skewed numeric features (tree models benefit from monotonic transforms)
+        if 'Total Claim Amount' in df.columns:
+            df['Total_Claim_Amount_Log'] = np.log1p(df['Total Claim Amount'])
+        if 'Monthly Premium Auto' in df.columns:
+            df['Monthly_Premium_Auto_Log'] = np.log1p(df['Monthly Premium Auto'])
         
         # Premium value ratio
         if 'Monthly Premium Auto' in df.columns and 'Income' in df.columns:
@@ -104,6 +124,14 @@ class FeatureEngineer:
         if 'Number of Policies' in df.columns:
             df['Is_Multi_Policy'] = (df['Number of Policies'] > 1).astype(int)
             df['Is_High_Policy_Count'] = (df['Number of Policies'] >= 3).astype(int)
+
+        # Optional date feature (if user keeps it in data)
+        if 'Effective To Date' in df.columns:
+            dt = pd.to_datetime(df['Effective To Date'], errors='coerce')
+            df['Effective_To_Date_Month'] = dt.dt.month.fillna(0).astype(int)
+            df['Effective_To_Date_Day'] = dt.dt.day.fillna(0).astype(int)
+            df['Effective_To_Date_Weekday'] = dt.dt.weekday.fillna(0).astype(int)
+            df['Effective_To_Date_Quarter'] = dt.dt.quarter.fillna(0).astype(int)
         
         return df
     
@@ -111,13 +139,13 @@ class FeatureEngineer:
         """
         Create statistical aggregation features using count encoding and median encoding.
         
-        WARNING: Target encoding is DISABLED by default to prevent data leakage.
-        Target encoding can cause severe data leakage in cross-validation if not done properly
-        (using out-of-fold encoding). It's disabled here to ensure safe feature engineering.
+        NOTE:
+        - Target encoding is intentionally NOT used here (leakage risk).
+        - We generate leakage-safe statistical features only.
         
         Args:
             df: Input dataframe (features only, no target column)
-            y: Target series (NOT USED - target encoding disabled)
+            y: Target series (not used; target encoding is not part of this pipeline)
             fit: Whether to fit encoders or use existing mappings
         
         Returns:
@@ -126,63 +154,87 @@ class FeatureEngineer:
         df = df.copy()
         
         # Initialize encoding maps if fitting
-        if fit and not hasattr(self, 'target_encoding_maps'):
-            # Clear any existing target encoding maps if target encoding is disabled
-            if not self.use_target_encoding:
-                self.target_encoding_maps = {}  # Keep empty to prevent accidental use
-            else:
-                self.target_encoding_maps = {}
+        if fit and not hasattr(self, 'count_encoding_maps'):
             self.count_encoding_maps = {}
             self.median_encoding_maps = {}
+            self.mean_encoding_maps = {}
+            self.std_encoding_maps = {}
+
+        # Store training-set reference statistics (used for fit=False to avoid test/val distribution peeking)
+        if fit:
+            self.train_size_ = int(len(df))
+            self.global_num_medians_ = {
+                col: float(df[col].median())
+                for col in self.numerical_features
+                if col in df.columns
+            }
+            self.global_num_means_ = {
+                col: float(df[col].mean())
+                for col in self.numerical_features
+                if col in df.columns
+            }
+
+        denom = int(getattr(self, "train_size_", 0) or 0)
+        if denom <= 0:
+            # Backward compatibility: if an old artifact is loaded without train_size_,
+            # fall back to current df size (not ideal but avoids crashing).
+            denom = max(len(df), 1)
         
         # Create statistical features for categorical columns
         for cat_col in self.categorical_features:
             if cat_col not in df.columns:
                 continue
-            
-            # TARGET ENCODING DISABLED - This was causing data leakage!
-            # Target encoding requires out-of-fold encoding in CV to be safe.
-            # For now, we disable it to prevent unrealistic AUC scores.
-            if self.use_target_encoding and fit and y is not None:
-                # Only enable if explicitly requested AND out-of-fold encoding is implemented
-                print(f"WARNING: Target encoding enabled for {cat_col}. Ensure out-of-fold encoding in CV!")
-                target_mean = pd.Series(y.values, index=df.index).groupby(df[cat_col]).mean()
-                self.target_encoding_maps[cat_col] = target_mean.to_dict()
-                df[f'{cat_col}_Target_Mean'] = df[cat_col].map(target_mean)
-            elif self.use_target_encoding and hasattr(self, 'target_encoding_maps') and cat_col in self.target_encoding_maps:
-                # Only use stored mapping if target encoding is explicitly enabled
-                df[f'{cat_col}_Target_Mean'] = df[cat_col].map(
-                    self.target_encoding_maps[cat_col]
-                ).fillna(0)
-            # If target encoding is disabled, DO NOT create or use target-encoded features
-            # This prevents leakage from old saved models
-            
+
             # Count encoding (SAFE - no target information used)
             if fit:
                 count_map = df[cat_col].value_counts().to_dict()
                 self.count_encoding_maps[cat_col] = count_map
                 df[f'{cat_col}_Count'] = df[cat_col].map(count_map)
+                # Frequency-style features (robust on low-cardinality categoricals)
+                df[f'{cat_col}_Freq'] = df[f'{cat_col}_Count'] / denom
+                df[f'{cat_col}_Count_Log'] = np.log1p(df[f'{cat_col}_Count'])
             elif hasattr(self, 'count_encoding_maps') and cat_col in self.count_encoding_maps:
                 df[f'{cat_col}_Count'] = df[cat_col].map(
                     self.count_encoding_maps[cat_col]
                 ).fillna(0)
+                df[f'{cat_col}_Freq'] = df[f'{cat_col}_Count'] / denom
+                df[f'{cat_col}_Count_Log'] = np.log1p(df[f'{cat_col}_Count'])
             
-            # Median encoding for numerical features grouped by category (SAFE - no target used)
+            # Aggregation encodings for numerical features grouped by category (SAFE - no target used)
             if fit:
                 for num_col in self.numerical_features:
                     if num_col in df.columns:
-                        median_map = df.groupby(cat_col)[num_col].median().to_dict()
-                        key = f'{cat_col}_{num_col}_Median'
-                        self.median_encoding_maps[key] = median_map
-                        df[key] = df[cat_col].map(median_map)
+                        grp = df.groupby(cat_col)[num_col]
+                        median_map = grp.median().to_dict()
+                        mean_map = grp.mean().to_dict()
+                        std_map = grp.std().fillna(0).to_dict()
+
+                        key_median = f'{cat_col}_{num_col}_Median'
+                        key_mean = f'{cat_col}_{num_col}_Mean'
+                        key_std = f'{cat_col}_{num_col}_Std'
+
+                        self.median_encoding_maps[key_median] = median_map
+                        self.mean_encoding_maps[key_mean] = mean_map
+                        self.std_encoding_maps[key_std] = std_map
+
+                        df[key_median] = df[cat_col].map(median_map)
+                        df[key_mean] = df[cat_col].map(mean_map)
+                        df[key_std] = df[cat_col].map(std_map)
             elif hasattr(self, 'median_encoding_maps'):
                 for num_col in self.numerical_features:
                     if num_col in df.columns:
-                        key = f'{cat_col}_{num_col}_Median'
-                        if key in self.median_encoding_maps:
-                            df[key] = df[cat_col].map(
-                                self.median_encoding_maps[key]
-                            ).fillna(df[num_col].median() if num_col in df.columns else 0)
+                        key_median = f'{cat_col}_{num_col}_Median'
+                        key_mean = f'{cat_col}_{num_col}_Mean'
+                        key_std = f'{cat_col}_{num_col}_Std'
+
+                        if key_median in self.median_encoding_maps:
+                            fallback_median = float(self.global_num_medians_.get(num_col, 0.0))
+                            df[key_median] = df[cat_col].map(self.median_encoding_maps[key_median]).fillna(fallback_median)
+                        if hasattr(self, 'mean_encoding_maps') and key_mean in self.mean_encoding_maps:
+                            fallback_mean = float(self.global_num_means_.get(num_col, 0.0))
+                            df[key_mean] = df[cat_col].map(self.mean_encoding_maps[key_mean]).fillna(fallback_mean)
+                        if hasattr(self, 'std_encoding_maps') and key_std in self.std_encoding_maps:
+                            df[key_std] = df[cat_col].map(self.std_encoding_maps[key_std]).fillna(0)
         
         return df
     
@@ -243,8 +295,9 @@ class FeatureEngineer:
                           and col != self.target_column
                           and df[col].dtype in [np.int64, np.int32, np.float64, np.float32]
                           and col not in available_num_features
-                          and not col.endswith('_Target_Mean')  # Don't scale target-encoded features
-                          and not col.endswith('_Count')]  # Don't scale count-encoded features
+                          and not col.endswith('_Count')  # Don't scale count-encoded features
+                          and not col.endswith('_Freq')   # Don't scale frequency features
+                          and not col.endswith('_Count_Log')]  # Don't scale log-count features
         
         all_num_features = available_num_features + new_num_features
         
@@ -256,7 +309,7 @@ class FeatureEngineer:
         
         return df
     
-    def handle_missing_values(self, df: pd.DataFrame) -> pd.DataFrame:
+    def handle_missing_values(self, df: pd.DataFrame, fit: bool = True) -> pd.DataFrame:
         """
         Handle missing values in the dataset.
         
@@ -267,18 +320,33 @@ class FeatureEngineer:
             Dataframe with missing values filled
         """
         df = df.copy()
+
+        # Learn fill statistics on training data only
+        if fit:
+            self.numeric_fill_values_ = {}
+            self.categorical_fill_values_ = {}
+
+            for col in self.numerical_features:
+                if col in df.columns:
+                    self.numeric_fill_values_[col] = float(df[col].median())
+
+            for col in self.categorical_features:
+                if col in df.columns:
+                    mode_series = df[col].mode()
+                    mode_val = mode_series.iloc[0] if len(mode_series) > 0 else 'Unknown'
+                    self.categorical_fill_values_[col] = mode_val
         
         # Numerical: fill with median
         for col in self.numerical_features:
             if col in df.columns and df[col].isnull().any():
-                median_val = df[col].median()
-                df[col].fillna(median_val, inplace=True)
+                fill_val = self.numeric_fill_values_.get(col, 0.0)
+                df[col] = df[col].fillna(fill_val)
         
         # Categorical: fill with mode
         for col in self.categorical_features:
             if col in df.columns and df[col].isnull().any():
-                mode_val = df[col].mode()[0] if len(df[col].mode()) > 0 else 'Unknown'
-                df[col].fillna(mode_val, inplace=True)
+                fill_val = self.categorical_fill_values_.get(col, 'Unknown')
+                df[col] = df[col].fillna(fill_val)
         
         return df
     
@@ -287,9 +355,9 @@ class FeatureEngineer:
         Complete feature engineering pipeline.
         Applies all transformations in the correct order.
         
-        IMPORTANT: Target encoding is DISABLED by default to prevent data leakage.
-        The y parameter is kept for API compatibility but target encoding won't be used
-        unless explicitly enabled and out-of-fold encoding is properly implemented.
+        IMPORTANT:
+        - Target encoding is not used in this pipeline (leakage risk).
+        - The y parameter is kept for API compatibility and future safe extensions.
         
         Args:
             df: Input dataframe (features only, should NOT contain target column)
@@ -307,7 +375,7 @@ class FeatureEngineer:
             df = df.drop(columns=[self.target_column])
         
         # Step 1: Handle missing values
-        df = self.handle_missing_values(df)
+        df = self.handle_missing_values(df, fit=fit)
         
         # Step 2: Create interaction features
         df = self.create_interaction_features(df)
@@ -338,8 +406,6 @@ class FeatureEngineer:
             df = df[self.feature_order]
         
         print(f"Feature engineering complete. Final shape: {df.shape}")
-        if not self.use_target_encoding:
-            print("Note: Target encoding is DISABLED to prevent data leakage. AUC should be realistic (0.7-0.9).")
         return df
     
     def save(self, path: Path):
@@ -355,10 +421,19 @@ class FeatureEngineer:
             'categorical_features': self.categorical_features,
             'numerical_features': self.numerical_features,
             'target_column': self.target_column,
-            'use_target_encoding': self.use_target_encoding,
+            # Legacy keys kept for backward compatibility (not used in current pipeline)
+            'use_target_encoding': False,
             'target_encoding_maps': getattr(self, 'target_encoding_maps', {}),
             'count_encoding_maps': getattr(self, 'count_encoding_maps', {}),
             'median_encoding_maps': getattr(self, 'median_encoding_maps', {}),
+            'mean_encoding_maps': getattr(self, 'mean_encoding_maps', {}),
+            'std_encoding_maps': getattr(self, 'std_encoding_maps', {}),
+            # New fitted artifacts (leakage-safe preprocessing)
+            'train_size': getattr(self, 'train_size_', None),
+            'numeric_fill_values': getattr(self, 'numeric_fill_values_', {}),
+            'categorical_fill_values': getattr(self, 'categorical_fill_values_', {}),
+            'global_num_medians': getattr(self, 'global_num_medians_', {}),
+            'global_num_means': getattr(self, 'global_num_means_', {}),
             'feature_order': getattr(self, 'feature_order', None)
         }
         joblib.dump(save_data, path)
@@ -379,14 +454,22 @@ class FeatureEngineer:
         engineer = cls(
             categorical_features=data['categorical_features'],
             numerical_features=data['numerical_features'],
-            target_column=data['target_column'],
-            use_target_encoding=data.get('use_target_encoding', False)
+            target_column=data['target_column']
         )
         engineer.label_encoders = data['label_encoders']
         engineer.scaler = data['scaler']
+        # Legacy field (not used in current pipeline)
         engineer.target_encoding_maps = data.get('target_encoding_maps', {})
         engineer.count_encoding_maps = data.get('count_encoding_maps', {})
         engineer.median_encoding_maps = data.get('median_encoding_maps', {})
+        engineer.mean_encoding_maps = data.get('mean_encoding_maps', {})
+        engineer.std_encoding_maps = data.get('std_encoding_maps', {})
         engineer.feature_order = data.get('feature_order', None)
+        # New fitted artifacts (backward-compatible defaults)
+        engineer.train_size_ = data.get('train_size', None)
+        engineer.numeric_fill_values_ = data.get('numeric_fill_values', {}) or {}
+        engineer.categorical_fill_values_ = data.get('categorical_fill_values', {}) or {}
+        engineer.global_num_medians_ = data.get('global_num_medians', {}) or {}
+        engineer.global_num_means_ = data.get('global_num_means', {}) or {}
         print(f"Feature engineer loaded from {path}")
         return engineer

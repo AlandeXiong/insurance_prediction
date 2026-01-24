@@ -3,6 +3,9 @@ import pandas as pd
 import numpy as np
 from typing import List, Dict, Tuple, Any
 
+from src.utils.config import get_paths, load_config
+from src.utils.logger import setup_logger
+
 
 def discover_features(df: pd.DataFrame, target_column: str = None) -> Dict[str, Any]:
     """
@@ -16,11 +19,22 @@ def discover_features(df: pd.DataFrame, target_column: str = None) -> Dict[str, 
     Returns:
         Dictionary with discovered features and metadata
     """
-    # Exclude target and ID columns
+    config = load_config()
+    paths = get_paths(config)
+    logger = setup_logger('training', paths['logs'])
+    # Exclude target, ID-like columns, and user-configured drop_features
     exclude_cols = [target_column] if target_column and target_column in df.columns else []
     exclude_cols.extend(['Customer', 'ID', 'id', 'Id'])
+
+    # Respect config.yaml filtering columns (features.drop_features)
+    drop_features = config.get('features', {}).get('drop_features', [])
+    if isinstance(drop_features, list):
+        exclude_cols.extend(drop_features)
+
+    logger.info("discover_features exclude_cols: %s", exclude_cols)
     
     all_cols = [col for col in df.columns if col not in exclude_cols]
+    logger.info("discover_features all_cols: %s", all_cols)
     
     # Discover numerical features
     numerical_features = []
@@ -84,6 +98,7 @@ def discover_features(df: pd.DataFrame, target_column: str = None) -> Dict[str, 
         'categorical_features': categorical_features,
         'date_features': date_features,
         'statistics': feature_stats,
+        # total_features is sum of numerical + categorical, excluding date features and statistics features
         'total_features': len(numerical_features) + len(categorical_features)
     }
 
