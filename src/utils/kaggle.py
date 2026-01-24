@@ -5,7 +5,7 @@ import shutil
 import os
 
 
-target_dir = "/Users/xiongjian/PycharmProjects/InsurancePrediction/dataset"
+target_dir = "/Users/xiongjian/models/datasets"
 
 
 cache_path = kagglehub.dataset_download("pankajjsh06/ibm-watson-marketing-customer-value-data")

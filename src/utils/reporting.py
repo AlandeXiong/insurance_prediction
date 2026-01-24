@@ -59,7 +59,9 @@ class ModelReportGenerator:
                                 feature_importance: Dict[str, Dict[str, float]],
                                 cv_scores: Dict[str, np.ndarray],
                                 test_results: Dict[str, Dict[str, float]],
-                                training_time: float = None) -> Dict[str, Any]:
+                                training_time: float = None,
+                                cv_metric_name: str = "cv_score",
+                                best_model_metric: str = "roc_auc") -> Dict[str, Any]:
         """
         Generate comprehensive training report.
         
@@ -77,6 +79,8 @@ class ModelReportGenerator:
             'timestamp': datetime.now().isoformat(),
             'training_time_seconds': training_time,
             'models_trained': list(test_results.keys()),
+            'cv_metric': cv_metric_name,
+            'best_model_metric': best_model_metric,
             'cross_validation': {},
             'test_performance': {},
             'best_model': None,
@@ -96,15 +100,15 @@ class ModelReportGenerator:
             }
         
         # Test performance summary
-        best_auc = 0
+        best_value = -1.0
         for model_name, metrics in test_results.items():
             # Convert numpy types to Python native types
             report['test_performance'][model_name] = {
                 k: convert_numpy_types(v) for k, v in metrics.items()
             }
-            roc_auc = float(metrics.get('roc_auc', 0))
-            if roc_auc > best_auc:
-                best_auc = roc_auc
+            metric_value = float(metrics.get(best_model_metric, metrics.get('roc_auc', 0.0)))
+            if metric_value > best_value:
+                best_value = metric_value
                 report['best_model'] = model_name
         
         # Feature importance summary
@@ -292,8 +296,9 @@ class ModelReportGenerator:
             patch.set_facecolor(color)
             patch.set_alpha(0.7)
         
-        ax.set_ylabel('ROC-AUC Score', fontsize=12)
-        ax.set_title('Cross-Validation Performance Comparison', 
+        cv_metric = self.report_data.get('cv_metric', 'CV Score')
+        ax.set_ylabel(str(cv_metric), fontsize=12)
+        ax.set_title('Cross-Validation Performance Comparison',
                     fontsize=14, fontweight='bold')
         ax.grid(True, alpha=0.3, axis='y')
         
@@ -325,9 +330,10 @@ class ModelReportGenerator:
         report_lines.append("\n" + "-" * 80)
         report_lines.append("CROSS-VALIDATION RESULTS")
         report_lines.append("-" * 80)
+        cv_metric = self.report_data.get('cv_metric', 'CV Score')
         for model_name, cv_data in self.report_data.get('cross_validation', {}).items():
             report_lines.append(f"\n{model_name.upper()}:")
-            report_lines.append(f"  Mean ROC-AUC: {cv_data['mean']:.4f} (+/- {cv_data['std']*2:.4f})")
+            report_lines.append(f"  Mean {cv_metric}: {cv_data['mean']:.4f} (+/- {cv_data['std']*2:.4f})")
             report_lines.append(f"  Min: {cv_data['min']:.4f}, Max: {cv_data['max']:.4f}")
         
         # Test performance

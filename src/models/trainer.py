@@ -7,7 +7,7 @@ from sklearn.metrics import (
     recall_score, f1_score, classification_report, confusion_matrix,
     precision_recall_curve, fbeta_score
 )
-# Note: LightGBM has been removed from the system
+import lightgbm as lgb
 import xgboost as xgb
 from catboost import CatBoostClassifier
 from sklearn.ensemble import VotingClassifier
@@ -28,7 +28,8 @@ class ModelTrainer:
     
     def __init__(self, cv_folds: int = 5, random_state: int = 42, 
                  scoring: str = 'roc_auc', n_trials: int = 100,
-                 min_recall: float = 0.6, optimize_threshold: bool = True):
+                 min_recall: float = 0.6, min_precision: float = 0.3,
+                 optimize_threshold: bool = True):
         """
         Initialize model trainer.
         
@@ -38,6 +39,7 @@ class ModelTrainer:
             scoring: Scoring metric for optimization
             n_trials: Number of optimization trials
             min_recall: Minimum recall requirement (default 0.6)
+            min_precision: Minimum precision requirement (default 0.3)
             optimize_threshold: Whether to optimize prediction threshold
         """
         self.cv_folds = cv_folds
@@ -45,6 +47,7 @@ class ModelTrainer:
         self.scoring = scoring
         self.n_trials = n_trials
         self.min_recall = min_recall
+        self.min_precision = min_precision
         self.optimize_threshold = optimize_threshold
         
         self.models = {}
@@ -53,6 +56,10 @@ class ModelTrainer:
         self.feature_importance = {}
         self.best_thresholds = {}  # Store optimal thresholds for each model
         self.class_weights = None  # Will be computed from training data
+        # OOF fold artifacts (feature engineer + fold models) for leakage-free bagging inference
+        # This is crucial to keep threshold selection and test-time probability distribution consistent.
+        self.oof_baggers_raw: Dict[str, List[Dict[str, Any]]] = {}
+        self.ensemble_base_models: List[str] = []
     
     def compute_class_weights(self, y: pd.Series) -> Dict[int, float]:
         """
@@ -69,12 +76,553 @@ class ModelTrainer:
         class_weights = dict(zip(classes, weights))
         print(f"Computed class weights: {class_weights}")
         return class_weights
-    
-    def find_optimal_threshold(self, y_true: np.ndarray, y_pred_proba: np.ndarray, 
-                               min_recall: float = 0.6) -> Tuple[float, Dict[str, float]]:
+
+    def _lgbm_default_params(self) -> Dict[str, Any]:
+        """Default LightGBM parameters (safe baseline on macOS)."""
+        return {
+            "objective": "binary",
+            "metric": "auc",
+            "learning_rate": 0.05,
+            "num_leaves": 31,
+            "min_child_samples": 20,
+            "subsample": 0.8,
+            "colsample_bytree": 0.8,
+            "reg_alpha": 0.0,
+            "reg_lambda": 0.0,
+            "random_state": self.random_state,
+            "n_jobs": -1,
+            "verbosity": -1,
+        }
+
+    def optimize_lightgbm(self, X_train: pd.DataFrame, y_train: pd.Series) -> Dict[str, Any]:
         """
-        Find optimal threshold that meets minimum recall requirement
-        while maximizing precision.
+        Optimize LightGBM hyperparameters with class imbalance handling.
+        Optimizes precision under constraints: recall >= min_recall AND precision >= min_precision.
+        """
+        print("\nOptimizing LightGBM...")
+
+        class_weights = self.compute_class_weights(y_train)
+        scale_pos_weight = class_weights.get(1, 1.0) / class_weights.get(0, 1.0) if 0 in class_weights and 1 in class_weights else 1.0
+
+        def objective(trial):
+            params = {
+                "objective": "binary",
+                "metric": "auc",
+                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2),
+                "num_leaves": trial.suggest_int("num_leaves", 16, 256, log=True),
+                "max_depth": trial.suggest_int("max_depth", 3, 12),
+                "min_child_samples": trial.suggest_int("min_child_samples", 10, 200),
+                "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
+                "reg_alpha": trial.suggest_float("reg_alpha", 1e-9, 10.0, log=True),
+                "reg_lambda": trial.suggest_float("reg_lambda", 1e-9, 10.0, log=True),
+                "scale_pos_weight": trial.suggest_float("scale_pos_weight", 0.5, scale_pos_weight * 2),
+                "random_state": self.random_state,
+                "n_jobs": -1,
+                "verbosity": -1,
+            }
+
+            cv = StratifiedKFold(n_splits=self.cv_folds, shuffle=True, random_state=self.random_state)
+            scores = []
+            for train_idx, val_idx in cv.split(X_train, y_train):
+                X_tr, X_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
+                y_tr, y_val = y_train.iloc[train_idx], y_train.iloc[val_idx]
+
+                model = lgb.LGBMClassifier(**params, n_estimators=5000)
+                model.fit(
+                    X_tr,
+                    y_tr,
+                    eval_set=[(X_val, y_val)],
+                    callbacks=[lgb.early_stopping(stopping_rounds=100, verbose=False)],
+                )
+                proba = model.predict_proba(X_val)[:, 1]
+                _, metrics = self.find_optimal_threshold(
+                    y_val.values,
+                    proba,
+                    min_recall=self.min_recall,
+                    min_precision=self.min_precision,
+                )
+                score = metrics["precision"] if (metrics["recall"] >= self.min_recall and metrics["precision"] >= self.min_precision) else 0.0
+                scores.append(score)
+
+            return float(np.mean(scores))
+
+        study = optuna.create_study(direction="maximize", study_name="lightgbm_opt")
+        study.optimize(objective, n_trials=self.n_trials, show_progress_bar=True)
+
+        best_params = dict(study.best_params)
+        best_params.update(
+            {
+                "objective": "binary",
+                "metric": "auc",
+                "random_state": self.random_state,
+                "n_jobs": -1,
+                "verbosity": -1,
+            }
+        )
+
+        print(f"Best LightGBM params: {best_params}")
+        print(f"Best CV precision@recall>={self.min_recall}: {study.best_value:.4f}")
+        return best_params
+
+    def train_lightgbm(
+        self,
+        X_train: pd.DataFrame,
+        y_train: pd.Series,
+        X_val: Optional[pd.DataFrame] = None,
+        y_val: Optional[pd.Series] = None,
+        optimize: bool = True,
+        params_override: Optional[Dict[str, Any]] = None,
+    ) -> lgb.LGBMClassifier:
+        """
+        Train LightGBM model with class imbalance handling.
+        Uses the same feature pipeline as other models (expects engineered numeric matrix).
+        """
+        print("\nTraining LightGBM...")
+
+        class_weights = self.compute_class_weights(y_train)
+        scale_pos_weight = class_weights.get(1, 1.0) / class_weights.get(0, 1.0) if 0 in class_weights and 1 in class_weights else 1.0
+
+        if params_override is not None:
+            params = dict(params_override)
+        elif optimize:
+            params = self.optimize_lightgbm(X_train, y_train)
+            self.best_params["lightgbm"] = params
+        else:
+            params = self._lgbm_default_params()
+            params["scale_pos_weight"] = scale_pos_weight
+
+        # Ensure key params exist
+        params.setdefault("objective", "binary")
+        params.setdefault("metric", "auc")
+        params.setdefault("random_state", self.random_state)
+        params.setdefault("n_jobs", -1)
+        params.setdefault("verbosity", -1)
+        params.setdefault("scale_pos_weight", scale_pos_weight)
+
+        model = lgb.LGBMClassifier(**params, n_estimators=5000)
+        if X_val is not None and y_val is not None:
+            model.fit(
+                X_train,
+                y_train,
+                eval_set=[(X_val, y_val)],
+                callbacks=[lgb.early_stopping(stopping_rounds=100, verbose=False)],
+            )
+
+            if self.optimize_threshold:
+                y_val_proba = model.predict_proba(X_val)[:, 1]
+                best_threshold, threshold_metrics = self.find_optimal_threshold(
+                    y_val.values,
+                    y_val_proba,
+                    min_recall=self.min_recall,
+                    min_precision=self.min_precision,
+                )
+                self.best_thresholds["lightgbm"] = best_threshold
+                print(f"Optimal threshold for LightGBM: {best_threshold:.4f}")
+                print(
+                    f"  Precision: {threshold_metrics['precision']:.4f}, "
+                    f"Recall: {threshold_metrics['recall']:.4f}, F1: {threshold_metrics['f1']:.4f}"
+                )
+        else:
+            model.fit(X_train, y_train)
+            self.best_thresholds["lightgbm"] = 0.5
+
+        self.models["lightgbm"] = model
+        # Feature importance (gain-based)
+        try:
+            importances = getattr(model, "feature_importances_", None)
+            if importances is not None:
+                self.feature_importance["lightgbm"] = dict(zip(X_train.columns, importances))
+        except Exception:
+            self.feature_importance["lightgbm"] = {}
+
+        return model
+
+    @staticmethod
+    def _cat_feature_indices(X: pd.DataFrame, cat_feature_names: Optional[List[str]]) -> Optional[List[int]]:
+        """
+        Convert categorical feature names to CatBoost column indices.
+        Works even if categorical columns are label-encoded as integers, as long as
+        we pass the indices via `cat_features`.
+        """
+        if not cat_feature_names:
+            return None
+        indices = [X.columns.get_loc(c) for c in cat_feature_names if c in X.columns]
+        return indices if indices else None
+
+    def fit_oof_thresholds(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        model_names: Optional[List[str]] = None,
+        cat_feature_names: Optional[List[str]] = None,
+    ) -> Dict[str, Dict[str, float]]:
+        """
+        Fit *one* robust threshold per model using out-of-fold (OOF) predictions on TRAIN.
+
+        Why:
+        - Picking a threshold on a single split can overfit and collapse recall on test.
+        - OOF thresholding is a Kaggle-style best practice for stable operating points.
+
+        Returns:
+            {model_name: {"threshold": ..., "precision": ..., "recall": ..., "f1": ..., "f2": ...}}
+        """
+        if model_names is None:
+            model_names = list(self.models.keys())
+
+        cv = StratifiedKFold(n_splits=self.cv_folds, shuffle=True, random_state=self.random_state)
+        results: Dict[str, Dict[str, float]] = {}
+
+        for name in model_names:
+            if name not in self.models:
+                continue
+
+            model = self.models[name]
+            oof_proba = np.zeros(len(y), dtype=float)
+
+            for train_idx, val_idx in cv.split(X, y):
+                X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
+                y_tr = y.iloc[train_idx]
+
+                # Ensemble: compute OOF proba as mean of base learners (soft voting)
+                if isinstance(model, VotingClassifier):
+                    fold_probas = []
+                    for est_name, est_model in model.named_estimators_.items():
+                        est_type = type(est_model)
+                        est_params = est_model.get_params()
+                        est_copy = est_type(**est_params)
+
+                        if isinstance(est_copy, CatBoostClassifier):
+                            cat_features = self._cat_feature_indices(X_tr, cat_feature_names)
+                            est_copy.fit(X_tr, y_tr, cat_features=cat_features, verbose=False)
+                        else:
+                            est_copy.fit(X_tr, y_tr)
+
+                        fold_probas.append(est_copy.predict_proba(X_val)[:, 1])
+
+                    oof_proba[val_idx] = np.mean(np.vstack(fold_probas), axis=0)
+                else:
+                    from sklearn.base import clone
+
+                    model_copy = clone(model)
+                    if isinstance(model_copy, CatBoostClassifier):
+                        cat_features = self._cat_feature_indices(X_tr, cat_feature_names)
+                        model_copy.fit(X_tr, y_tr, cat_features=cat_features, verbose=False)
+                    else:
+                        model_copy.fit(X_tr, y_tr)
+
+                    oof_proba[val_idx] = model_copy.predict_proba(X_val)[:, 1]
+
+            # Pick threshold on OOF predictions under constraints
+            threshold, metrics = self.find_optimal_threshold(
+                y.values,
+                oof_proba,
+                min_recall=self.min_recall,
+                min_precision=self.min_precision,
+            )
+            self.best_thresholds[name] = float(threshold)
+            results[name] = {k: float(v) for k, v in metrics.items()}
+
+        return results
+
+    def fit_oof_thresholds_raw(
+        self,
+        X_raw: pd.DataFrame,
+        y: pd.Series,
+        feature_engineer_kwargs: Dict[str, Any],
+        model_names: Optional[List[str]] = None,
+        cat_feature_names: Optional[List[str]] = None,
+    ) -> Dict[str, Dict[str, float]]:
+        """
+        Fit robust thresholds using OOF predictions where *feature engineering is fit per fold*.
+
+        This removes a major source of leakage/overconfidence:
+        - If you precompute engineered features on the full training set, then do CV/OOF on them,
+          your encoders/scalers/aggregations have already "seen" the validation folds.
+        - That inflates CV metrics and produces thresholds that do not generalize to the test set.
+        """
+        from src.features.engineering import FeatureEngineer
+
+        if model_names is None:
+            model_names = list(self.models.keys())
+
+        cv = StratifiedKFold(n_splits=self.cv_folds, shuffle=True, random_state=self.random_state)
+        results: Dict[str, Dict[str, float]] = {}
+        self.oof_baggers_raw = {}
+
+        # Prepare fallbacks if some models weren't optimized in the selected mode
+        default_xgb_params = {
+            'objective': 'binary:logistic',
+            'eval_metric': 'auc',
+            'max_depth': 6,
+            'learning_rate': 0.05,
+            'subsample': 0.8,
+            'colsample_bytree': 0.8,
+            'random_state': self.random_state,
+            'verbosity': 0,
+        }
+        default_cat_params = {
+            'iterations': 1000,
+            'learning_rate': 0.05,
+            'depth': 6,
+            'l2_leaf_reg': 3,
+            'random_seed': self.random_state,
+            'verbose': False,
+        }
+
+        for name in model_names:
+            if name not in self.models and name != "ensemble":
+                continue
+
+            oof_proba = np.zeros(len(y), dtype=float)
+            fold_artifacts: List[Dict[str, Any]] = []
+
+            for train_idx, val_idx in cv.split(X_raw, y):
+                X_tr_raw, X_val_raw = X_raw.iloc[train_idx], X_raw.iloc[val_idx]
+                y_tr = y.iloc[train_idx]
+
+                # Fit feature engineering on the training fold only
+                fe = FeatureEngineer(**feature_engineer_kwargs)
+                X_tr = fe.transform(X_tr_raw, y=y_tr, fit=True)
+                X_val = fe.transform(X_val_raw, fit=False)
+
+                # Train + predict probabilities
+                if name == "xgboost":
+                    params = dict(self.best_params.get("xgboost", default_xgb_params))
+                    # Handle imbalance per fold (Kaggle best practice)
+                    cw = self.compute_class_weights(y_tr)
+                    scale_pos_weight = cw.get(1, 1.0) / cw.get(0, 1.0) if 0 in cw and 1 in cw else 1.0
+                    params.setdefault("scale_pos_weight", scale_pos_weight)
+                    params.setdefault("objective", "binary:logistic")
+                    params.setdefault("eval_metric", "auc")
+                    params.setdefault("random_state", self.random_state)
+                    params.setdefault("verbosity", 0)
+                    model = xgb.XGBClassifier(**params, n_estimators=1000)
+                    model.fit(X_tr, y_tr)
+                    oof_proba[val_idx] = model.predict_proba(X_val)[:, 1]
+                    fold_artifacts.append({"fe": fe, "model": model})
+
+                elif name == "catboost":
+                    params = dict(self.best_params.get("catboost", default_cat_params))
+                    cw = self.compute_class_weights(y_tr)
+                    params.setdefault("class_weights", [cw.get(0, 1.0), cw.get(1, 1.0)])
+                    params.setdefault("random_seed", self.random_state)
+                    params.setdefault("verbose", False)
+                    model = CatBoostClassifier(**params)
+                    cat_features = self._cat_feature_indices(X_tr, cat_feature_names)
+                    model.fit(X_tr, y_tr, cat_features=cat_features, verbose=False)
+                    oof_proba[val_idx] = model.predict_proba(X_val)[:, 1]
+                    fold_artifacts.append({"fe": fe, "model": model})
+
+                elif name == "ensemble":
+                    # Soft voting: mean of base model probabilities
+                    fold_probas = []
+
+                    cw = self.compute_class_weights(y_tr)
+                    scale_pos_weight = cw.get(1, 1.0) / cw.get(0, 1.0) if 0 in cw and 1 in cw else 1.0
+
+                    base_models = list(self.ensemble_base_models) if self.ensemble_base_models else ["xgb", "cat", "lgb"]
+                    models_dict: Dict[str, Any] = {}
+
+                    # LightGBM base
+                    if "lgb" in base_models:
+                        params_lgb = dict(self.best_params.get("lightgbm", self._lgbm_default_params()))
+                        params_lgb.setdefault("objective", "binary")
+                        params_lgb.setdefault("metric", "auc")
+                        params_lgb.setdefault("random_state", self.random_state)
+                        params_lgb.setdefault("n_jobs", -1)
+                        params_lgb.setdefault("verbosity", -1)
+                        params_lgb.setdefault("scale_pos_weight", scale_pos_weight)
+                        m_lgb = lgb.LGBMClassifier(**params_lgb, n_estimators=5000)
+                        m_lgb.fit(X_tr, y_tr)
+                        fold_probas.append(m_lgb.predict_proba(X_val)[:, 1])
+                        models_dict["lgb"] = m_lgb
+
+                    # XGBoost base
+                    if "xgb" in base_models:
+                        params_xgb = dict(self.best_params.get("xgboost", default_xgb_params))
+                        params_xgb.setdefault("scale_pos_weight", scale_pos_weight)
+                        params_xgb.setdefault("objective", "binary:logistic")
+                        params_xgb.setdefault("eval_metric", "auc")
+                        params_xgb.setdefault("random_state", self.random_state)
+                        params_xgb.setdefault("verbosity", 0)
+                        m_xgb = xgb.XGBClassifier(**params_xgb, n_estimators=1000)
+                        m_xgb.fit(X_tr, y_tr)
+                        fold_probas.append(m_xgb.predict_proba(X_val)[:, 1])
+                        models_dict["xgb"] = m_xgb
+
+                    # CatBoost base
+                    if "cat" in base_models:
+                        params_cat = dict(self.best_params.get("catboost", default_cat_params))
+                        params_cat.setdefault("class_weights", [cw.get(0, 1.0), cw.get(1, 1.0)])
+                        params_cat.setdefault("random_seed", self.random_state)
+                        params_cat.setdefault("verbose", False)
+                        m_cat = CatBoostClassifier(**params_cat)
+                        cat_features = self._cat_feature_indices(X_tr, cat_feature_names)
+                        m_cat.fit(X_tr, y_tr, cat_features=cat_features, verbose=False)
+                        fold_probas.append(m_cat.predict_proba(X_val)[:, 1])
+                        models_dict["cat"] = m_cat
+
+                    oof_proba[val_idx] = float(np.mean(np.vstack(fold_probas), axis=0)) if len(fold_probas) == 1 else np.mean(np.vstack(fold_probas), axis=0)
+                    fold_artifacts.append({"fe": fe, "models": models_dict})
+
+                else:
+                    # Unsupported model name for raw OOF thresholding
+                    continue
+
+            threshold, metrics = self.find_optimal_threshold(
+                y.values,
+                oof_proba,
+                min_recall=self.min_recall,
+                min_precision=self.min_precision,
+            )
+            self.best_thresholds[name] = float(threshold)
+            results[name] = {k: float(v) for k, v in metrics.items()}
+            self.oof_baggers_raw[name] = fold_artifacts
+
+        return results
+
+    def predict_proba_bagged_raw(self, X_raw: pd.DataFrame, model_name: str) -> np.ndarray:
+        """
+        Predict probabilities on raw features using the OOF fold models (bagging).
+
+        Why:
+        - The OOF-selected threshold is based on fold-specific feature engineering + fold models.
+        - To apply that threshold on the test set, probabilities must come from the *same* process.
+        """
+        if model_name not in self.oof_baggers_raw or not self.oof_baggers_raw[model_name]:
+            raise ValueError(f"No OOF baggers found for model '{model_name}'. Run fit_oof_thresholds_raw first.")
+
+        fold_probas = []
+        for artifact in self.oof_baggers_raw[model_name]:
+            fe = artifact["fe"]
+            X_proc = fe.transform(X_raw, fit=False)
+
+            if model_name == "ensemble":
+                models_dict = artifact["models"]
+                probs = []
+                for m in models_dict.values():
+                    probs.append(m.predict_proba(X_proc)[:, 1])
+                p = np.mean(np.vstack(probs), axis=0)
+            else:
+                p = artifact["model"].predict_proba(X_proc)[:, 1]
+            fold_probas.append(p)
+
+        return np.mean(np.vstack(fold_probas), axis=0)
+
+    def cross_validate_raw(
+        self,
+        X_raw: pd.DataFrame,
+        y: pd.Series,
+        feature_engineer_kwargs: Dict[str, Any],
+        model_names: Optional[List[str]] = None,
+        cat_feature_names: Optional[List[str]] = None,
+    ) -> Dict[str, np.ndarray]:
+        """
+        Leakage-free CV where feature engineering is fit per fold.
+
+        Returns per-fold scores for each model using the business objective:
+        maximize precision under (recall >= min_recall and precision >= min_precision).
+        """
+        from src.features.engineering import FeatureEngineer
+
+        if model_names is None:
+            model_names = list(self.models.keys())
+
+        cv = StratifiedKFold(n_splits=self.cv_folds, shuffle=True, random_state=self.random_state)
+        cv_scores: Dict[str, np.ndarray] = {}
+
+        default_xgb_params = self.best_params.get("xgboost", {
+            'objective': 'binary:logistic',
+            'eval_metric': 'auc',
+            'max_depth': 6,
+            'learning_rate': 0.05,
+            'subsample': 0.8,
+            'colsample_bytree': 0.8,
+            'random_state': self.random_state,
+            'verbosity': 0,
+        })
+        default_cat_params = self.best_params.get("catboost", {
+            'iterations': 1000,
+            'learning_rate': 0.05,
+            'depth': 6,
+            'l2_leaf_reg': 3,
+            'random_seed': self.random_state,
+            'verbose': False,
+        })
+
+        for name in model_names:
+            fold_scores: List[float] = []
+
+            for train_idx, val_idx in cv.split(X_raw, y):
+                X_tr_raw, X_val_raw = X_raw.iloc[train_idx], X_raw.iloc[val_idx]
+                y_tr, y_val = y.iloc[train_idx], y.iloc[val_idx]
+
+                fe = FeatureEngineer(**feature_engineer_kwargs)
+                X_tr = fe.transform(X_tr_raw, y=y_tr, fit=True)
+                X_val = fe.transform(X_val_raw, fit=False)
+
+                cw = self.compute_class_weights(y_tr)
+                scale_pos_weight = cw.get(1, 1.0) / cw.get(0, 1.0) if 0 in cw and 1 in cw else 1.0
+
+                if name == "xgboost":
+                    params = dict(default_xgb_params)
+                    params.setdefault("scale_pos_weight", scale_pos_weight)
+                    m = xgb.XGBClassifier(**params, n_estimators=1000)
+                    m.fit(X_tr, y_tr)
+                    proba = m.predict_proba(X_val)[:, 1]
+
+                elif name == "catboost":
+                    params = dict(default_cat_params)
+                    params.setdefault("class_weights", [cw.get(0, 1.0), cw.get(1, 1.0)])
+                    m = CatBoostClassifier(**params)
+                    cat_features = self._cat_feature_indices(X_tr, cat_feature_names)
+                    m.fit(X_tr, y_tr, cat_features=cat_features, verbose=False)
+                    proba = m.predict_proba(X_val)[:, 1]
+
+                elif name == "ensemble":
+                    params_xgb = dict(default_xgb_params)
+                    params_xgb.setdefault("scale_pos_weight", scale_pos_weight)
+                    m_xgb = xgb.XGBClassifier(**params_xgb, n_estimators=1000)
+                    m_xgb.fit(X_tr, y_tr)
+                    p_xgb = m_xgb.predict_proba(X_val)[:, 1]
+
+                    params_cat = dict(default_cat_params)
+                    params_cat.setdefault("class_weights", [cw.get(0, 1.0), cw.get(1, 1.0)])
+                    m_cat = CatBoostClassifier(**params_cat)
+                    cat_features = self._cat_feature_indices(X_tr, cat_feature_names)
+                    m_cat.fit(X_tr, y_tr, cat_features=cat_features, verbose=False)
+                    p_cat = m_cat.predict_proba(X_val)[:, 1]
+
+                    proba = (p_xgb + p_cat) / 2.0
+                else:
+                    continue
+
+                _, metrics = self.find_optimal_threshold(
+                    y_val.values,
+                    proba,
+                    min_recall=self.min_recall,
+                    min_precision=self.min_precision,
+                )
+                score = metrics["precision"] if (metrics["recall"] >= self.min_recall and metrics["precision"] >= self.min_precision) else 0.0
+                fold_scores.append(float(score))
+
+            cv_scores[name] = np.array(fold_scores, dtype=float)
+
+        return cv_scores
+    
+    def find_optimal_threshold(self, y_true: np.ndarray, y_pred_proba: np.ndarray,
+                               min_recall: float = 0.6, min_precision: float = 0.0) -> Tuple[float, Dict[str, float]]:
+        """
+        Find an operating threshold that satisfies constraints and optimizes the business goal.
+
+        Primary objective:
+        - maximize precision subject to recall >= min_recall and precision >= min_precision
+
+        Notes on sklearn's `precision_recall_curve` output:
+        - precision/recall arrays have length = len(thresholds) + 1
+        - for each thresholds[i], the corresponding precision/recall are precision[i+1], recall[i+1]
+        - precision[0], recall[0] correspond to a threshold below the minimum score (predict all positive)
         
         Args:
             y_true: True labels
@@ -86,38 +634,45 @@ class ModelTrainer:
         """
         precision, recall, thresholds = precision_recall_curve(y_true, y_pred_proba)
         
-        # Note: precision_recall_curve returns arrays where last element is for threshold=1.0
-        # We need to prepend a threshold for the case where all predictions are positive
-        # thresholds array is one element shorter than precision/recall
-        # We'll add a very low threshold (0.0) to handle the case where recall=1.0
+        # Build aligned candidate points (threshold, precision, recall)
+        # Candidate 0: predict all positive (threshold=0.0)
+        candidates_t = [0.0]
+        candidates_p = [float(precision[0])]
+        candidates_r = [float(recall[0])]
+
+        # Candidates for each returned threshold
+        for i, t in enumerate(thresholds):
+            candidates_t.append(float(t))
+            candidates_p.append(float(precision[i + 1]))
+            candidates_r.append(float(recall[i + 1]))
+
+        candidates_t = np.array(candidates_t, dtype=float)
+        candidates_p = np.array(candidates_p, dtype=float)
+        candidates_r = np.array(candidates_r, dtype=float)
         
-        # Find thresholds that meet minimum recall requirement
-        valid_indices = np.where(recall >= min_recall)[0]
-        
-        if len(valid_indices) == 0:
-            # If no threshold meets requirement, use threshold with max recall
-            best_idx = np.argmax(recall)
-            if best_idx < len(thresholds):
-                best_threshold = thresholds[best_idx]
-            elif best_idx == len(recall) - 1:
-                # Maximum recall (all positive) - use very low threshold
-                best_threshold = 0.0
-            else:
-                best_threshold = 0.5
-            print(f"Warning: No threshold meets min_recall={min_recall}. Using best available (recall={recall[best_idx]:.4f}).")
+        # Feasible set: satisfy BOTH constraints
+        feasible = np.where((candidates_r >= min_recall) & (candidates_p >= min_precision))[0]
+        if feasible.size > 0:
+            # Max precision, tie-break by higher recall
+            best_idx = feasible[np.lexsort((candidates_r[feasible], candidates_p[feasible]))][-1]
         else:
-            # Among valid thresholds, choose one with highest precision
-            valid_precisions = precision[valid_indices]
-            best_valid_idx = valid_indices[np.argmax(valid_precisions)]
-            if best_valid_idx < len(thresholds):
-                best_threshold = thresholds[best_valid_idx]
-            elif best_valid_idx == len(recall) - 1:
-                # Maximum recall case
-                best_threshold = 0.0
+            # Fallbacks (still deterministic and recall-friendly)
+            feasible_recall = np.where(candidates_r >= min_recall)[0]
+            feasible_precision = np.where(candidates_p >= min_precision)[0]
+
+            if feasible_recall.size > 0:
+                # Max precision under recall constraint
+                best_idx = feasible_recall[np.argmax(candidates_p[feasible_recall])]
+            elif feasible_precision.size > 0:
+                # Max recall under precision constraint
+                best_idx = feasible_precision[np.argmax(candidates_r[feasible_precision])]
             else:
-                best_threshold = 0.5
+                # Nothing meets constraints: maximize F2 (recall-weighted) as best-effort
+                beta2 = 2.0
+                f2 = (1 + beta2**2) * (candidates_p * candidates_r) / (beta2**2 * candidates_p + candidates_r + 1e-12)
+                best_idx = int(np.argmax(f2))
         
-        # Ensure threshold is in valid range [0, 1]
+        best_threshold = float(candidates_t[best_idx])
         best_threshold = max(0.0, min(1.0, best_threshold))
         
         # Calculate metrics at optimal threshold
@@ -135,7 +690,7 @@ class ModelTrainer:
     def optimize_xgboost(self, X_train: pd.DataFrame, y_train: pd.Series) -> Dict[str, Any]:
         """
         Optimize XGBoost hyperparameters with class imbalance handling.
-        Uses F1 score optimization to balance precision and recall.
+        Optimizes **precision subject to recall >= min_recall** (Kaggle-style threshold moving).
         """
         print("\nOptimizing XGBoost...")
         
@@ -176,10 +731,14 @@ class ModelTrainer:
                 y_pred_proba = model.predict_proba(X_val)[:, 1]
                 
                 # Optimize threshold on validation set
-                _, metrics = self.find_optimal_threshold(y_val.values, y_pred_proba, self.min_recall)
-                
-                # Use F1 score as optimization metric (balances precision and recall)
-                score = metrics['f1']
+                _, metrics = self.find_optimal_threshold(
+                    y_val.values, y_pred_proba,
+                    min_recall=self.min_recall,
+                    min_precision=self.min_precision
+                )
+
+                # Primary objective: maximize precision while meeting recall constraint
+                score = metrics['precision'] if (metrics['recall'] >= self.min_recall and metrics['precision'] >= self.min_precision) else 0.0
                 scores.append(score)
             
             return np.mean(scores)
@@ -196,14 +755,15 @@ class ModelTrainer:
         })
         
         print(f"Best XGBoost params: {best_params}")
-        print(f"Best CV F1 score: {study.best_value:.4f}")
+        print(f"Best CV precision@recall>={self.min_recall}: {study.best_value:.4f}")
         
         return best_params
     
-    def optimize_catboost(self, X_train: pd.DataFrame, y_train: pd.Series) -> Dict[str, Any]:
+    def optimize_catboost(self, X_train: pd.DataFrame, y_train: pd.Series,
+                          cat_feature_names: Optional[List[str]] = None) -> Dict[str, Any]:
         """
         Optimize CatBoost hyperparameters with class imbalance handling.
-        Uses F1 score optimization to balance precision and recall.
+        Optimizes **precision subject to recall >= min_recall** (Kaggle-style threshold moving).
         """
         print("\nOptimizing CatBoost...")
         
@@ -236,17 +796,22 @@ class ModelTrainer:
             for train_idx, val_idx in cv.split(X_train, y_train):
                 X_tr, X_val = X_train.iloc[train_idx], X_train.iloc[val_idx]
                 y_tr, y_val = y_train.iloc[train_idx], y_train.iloc[val_idx]
+                cat_features = self._cat_feature_indices(X_tr, cat_feature_names)
                 
                 model = CatBoostClassifier(**params)
-                model.fit(X_tr, y_tr, eval_set=(X_val, y_val), verbose=False)
+                model.fit(X_tr, y_tr, eval_set=(X_val, y_val), cat_features=cat_features, verbose=False)
                 
                 y_pred_proba = model.predict_proba(X_val)[:, 1]
                 
                 # Optimize threshold on validation set
-                _, metrics = self.find_optimal_threshold(y_val.values, y_pred_proba, self.min_recall)
-                
-                # Use F1 score as optimization metric
-                score = metrics['f1']
+                _, metrics = self.find_optimal_threshold(
+                    y_val.values, y_pred_proba,
+                    min_recall=self.min_recall,
+                    min_precision=self.min_precision
+                )
+
+                # Primary objective: maximize precision while meeting recall constraint
+                score = metrics['precision'] if (metrics['recall'] >= self.min_recall and metrics['precision'] >= self.min_precision) else 0.0
                 scores.append(score)
             
             return np.mean(scores)
@@ -265,14 +830,15 @@ class ModelTrainer:
         })
         
         print(f"Best CatBoost params: {best_params}")
-        print(f"Best CV F1 score: {study.best_value:.4f}")
+        print(f"Best CV precision@recall>={self.min_recall}: {study.best_value:.4f}")
         
         return best_params
     
     def train_xgboost(self, X_train: pd.DataFrame, y_train: pd.Series,
                      X_val: Optional[pd.DataFrame] = None,
                      y_val: Optional[pd.Series] = None,
-                     optimize: bool = True) -> xgb.XGBClassifier:
+                     optimize: bool = True,
+                     params_override: Optional[Dict[str, Any]] = None) -> xgb.XGBClassifier:
         """
         Train XGBoost model with class imbalance handling.
         All models use the same feature engineering pipeline.
@@ -283,7 +849,9 @@ class ModelTrainer:
         class_weights = self.compute_class_weights(y_train)
         scale_pos_weight = class_weights[1] / class_weights[0] if 0 in class_weights and 1 in class_weights else 1.0
         
-        if optimize:
+        if params_override is not None:
+            params = dict(params_override)
+        elif optimize:
             params = self.optimize_xgboost(X_train, y_train)
             self.best_params['xgboost'] = params
         else:
@@ -298,6 +866,13 @@ class ModelTrainer:
                 'random_state': self.random_state,
                 'verbosity': 0
             }
+
+        # Ensure key params exist
+        params.setdefault('objective', 'binary:logistic')
+        params.setdefault('eval_metric', 'auc')
+        params.setdefault('random_state', self.random_state)
+        params.setdefault('verbosity', 0)
+        params.setdefault('scale_pos_weight', scale_pos_weight)
         
         model = xgb.XGBClassifier(**params, n_estimators=1000)
         
@@ -311,7 +886,9 @@ class ModelTrainer:
             if self.optimize_threshold:
                 y_val_proba = model.predict_proba(X_val)[:, 1]
                 best_threshold, threshold_metrics = self.find_optimal_threshold(
-                    y_val.values, y_val_proba, self.min_recall
+                    y_val.values, y_val_proba,
+                    min_recall=self.min_recall,
+                    min_precision=self.min_precision
                 )
                 self.best_thresholds['xgboost'] = best_threshold
                 print(f"Optimal threshold for XGBoost: {best_threshold:.4f}")
@@ -331,7 +908,9 @@ class ModelTrainer:
     def train_catboost(self, X_train: pd.DataFrame, y_train: pd.Series,
                       X_val: Optional[pd.DataFrame] = None,
                       y_val: Optional[pd.Series] = None,
-                      optimize: bool = True) -> CatBoostClassifier:
+                      optimize: bool = True,
+                      cat_feature_names: Optional[List[str]] = None,
+                      params_override: Optional[Dict[str, Any]] = None) -> CatBoostClassifier:
         """
         Train CatBoost model with class imbalance handling.
         All models use the same feature engineering pipeline.
@@ -342,8 +921,10 @@ class ModelTrainer:
         class_weights = self.compute_class_weights(y_train)
         class_weights_list = [class_weights.get(0, 1.0), class_weights.get(1, 1.0)]
         
-        if optimize:
-            params = self.optimize_catboost(X_train, y_train)
+        if params_override is not None:
+            params = dict(params_override)
+        elif optimize:
+            params = self.optimize_catboost(X_train, y_train, cat_feature_names=cat_feature_names)
             self.best_params['catboost'] = params
         else:
             params = {
@@ -355,23 +936,32 @@ class ModelTrainer:
                 'random_seed': self.random_state,
                 'verbose': False
             }
+
+        # Ensure key params exist
+        params.setdefault('iterations', 1000)
+        params.setdefault('class_weights', class_weights_list)
+        params.setdefault('random_seed', self.random_state)
+        params.setdefault('verbose', False)
         
         model = CatBoostClassifier(**params)
+        cat_features = self._cat_feature_indices(X_train, cat_feature_names)
         
         if X_val is not None and y_val is not None:
-            model.fit(X_train, y_train, eval_set=(X_val, y_val), verbose=False)
+            model.fit(X_train, y_train, eval_set=(X_val, y_val), cat_features=cat_features, verbose=False)
             
             # Find optimal threshold on validation set
             if self.optimize_threshold:
                 y_val_proba = model.predict_proba(X_val)[:, 1]
                 best_threshold, threshold_metrics = self.find_optimal_threshold(
-                    y_val.values, y_val_proba, self.min_recall
+                    y_val.values, y_val_proba,
+                    min_recall=self.min_recall,
+                    min_precision=self.min_precision
                 )
                 self.best_thresholds['catboost'] = best_threshold
                 print(f"Optimal threshold for CatBoost: {best_threshold:.4f}")
                 print(f"  Precision: {threshold_metrics['precision']:.4f}, Recall: {threshold_metrics['recall']:.4f}, F1: {threshold_metrics['f1']:.4f}")
         else:
-            model.fit(X_train, y_train, verbose=False)
+            model.fit(X_train, y_train, cat_features=cat_features, verbose=False)
             # Use default threshold if no validation set
             self.best_thresholds['catboost'] = 0.5
         
@@ -385,31 +975,31 @@ class ModelTrainer:
     def train_ensemble(self, X_train: pd.DataFrame, y_train: pd.Series,
                       X_val: Optional[pd.DataFrame] = None,
                       y_val: Optional[pd.Series] = None,
-                      method: str = 'voting') -> VotingClassifier:
+                      method: str = 'voting',
+                      base_models: Optional[List[str]] = None) -> VotingClassifier:
         """
         Train ensemble model.
-        Note: lightgbm has been removed, only train xgboost and catboost.
         All models use the same feature engineering pipeline.
         """
         print(f"\nTraining {method} ensemble...")
-        
-        # Ensure base models are trained (only train models that exist in self.models)
-        if 'xgboost' not in self.models:
-            self.train_xgboost(X_train, y_train, X_val, y_val, optimize=False)
-        if 'catboost' not in self.models:
-            self.train_catboost(X_train, y_train, X_val, y_val, optimize=False)
-        
-        # Build estimators list from available models (excluding lightgbm)
+
+        if base_models is None:
+            base_models = [m for m in ["lightgbm", "xgboost", "catboost"] if m in self.models]
+
+        # Build estimators list from selected base models (must already be trained for consistency)
         estimators = []
-        if 'xgboost' in self.models:
-            estimators.append(('xgb', self.models['xgboost']))
-        if 'catboost' in self.models:
-            estimators.append(('cat', self.models['catboost']))
+        if "lightgbm" in base_models and "lightgbm" in self.models:
+            estimators.append(("lgb", self.models["lightgbm"]))
+        if "xgboost" in base_models and "xgboost" in self.models:
+            estimators.append(("xgb", self.models["xgboost"]))
+        if "catboost" in base_models and "catboost" in self.models:
+            estimators.append(("cat", self.models["catboost"]))
         
         if not estimators:
-            raise ValueError("No base models available for ensemble. Train at least one model first.")
+            raise ValueError("No base models available for ensemble. Train base models first.")
         
         print(f"Ensemble will use {len(estimators)} model(s): {[name for name, _ in estimators]}")
+        self.ensemble_base_models = [name for name, _ in estimators]
         
         ensemble = VotingClassifier(estimators=estimators, voting='soft')
         ensemble.fit(X_train, y_train)
@@ -418,7 +1008,9 @@ class ModelTrainer:
         if self.optimize_threshold and X_val is not None and y_val is not None:
             y_val_proba = ensemble.predict_proba(X_val)[:, 1]
             best_threshold, threshold_metrics = self.find_optimal_threshold(
-                y_val.values, y_val_proba, self.min_recall
+                y_val.values, y_val_proba,
+                min_recall=self.min_recall,
+                min_precision=self.min_precision
             )
             self.best_thresholds['ensemble'] = best_threshold
             print(f"Optimal threshold for Ensemble: {best_threshold:.4f}")
@@ -431,7 +1023,7 @@ class ModelTrainer:
         return ensemble
     
     def evaluate(self, X: pd.DataFrame, y: pd.Series, model_name: str = None, 
-                 reoptimize_threshold: bool = True) -> Dict[str, float]:
+                 reoptimize_threshold: bool = False) -> Dict[str, float]:
         """
         Evaluate model(s) with optimal threshold.
         Uses threshold optimization to meet recall requirement.
@@ -440,8 +1032,8 @@ class ModelTrainer:
             X: Features
             y: True labels
             model_name: Specific model to evaluate, or None for all
-            reoptimize_threshold: If True, re-optimize threshold on this dataset
-                                 (useful when test set distribution differs from validation set)
+            reoptimize_threshold: If True, re-optimize threshold on this dataset.
+                                 WARNING: Do NOT set this to True for the TEST set (label leakage).
         """
         results = {}
         
@@ -501,7 +1093,10 @@ class ModelTrainer:
             print(f"  ROC-AUC: {results[name]['roc_auc']:.4f}")
             print(f"  Accuracy: {results[name]['accuracy']:.4f}")
             print(f"  Precision: {results[name]['precision']:.4f}")
-            print(f"  Recall: {results[name]['recall']:.4f} {'✓' if recall_optimal >= self.min_recall else '✗ (below min_recall=' + str(self.min_recall) + ')'}")
+            recall_ok = recall_optimal >= self.min_recall
+            precision_ok = precision_optimal >= self.min_precision
+            print(f"  Recall: {results[name]['recall']:.4f} {'✓' if recall_ok else '✗ (min_recall=' + str(self.min_recall) + ')'}")
+            print(f"  Constraint check: Precision>= {self.min_precision} {'✓' if precision_ok else '✗'} | Recall>= {self.min_recall} {'✓' if recall_ok else '✗'}")
             print(f"  F1-Score: {results[name]['f1']:.4f}")
             print(f"\n  Default Threshold (0.5) Comparison:")
             print(f"    Precision: {results[name]['precision_default']:.4f}, Recall: {results[name]['recall_default']:.4f}, F1: {results[name]['f1_default']:.4f}")
@@ -510,7 +1105,7 @@ class ModelTrainer:
     
     def cross_validate(self, X: pd.DataFrame, y: pd.Series) -> Dict[str, List[float]]:
         """
-        Cross-validation for all models using F1 score.
+        Cross-validation for all models using precision@recall>=min_recall.
         Handles ensemble models (VotingClassifier) specially.
         """
         print("\nPerforming cross-validation...")
@@ -551,14 +1146,19 @@ class ModelTrainer:
                 
                 # Find optimal threshold on this fold's validation set
                 # This ensures threshold is optimized per fold
-                best_threshold, _ = self.find_optimal_threshold(y_val.values, y_pred_proba, self.min_recall)
+                best_threshold, metrics = self.find_optimal_threshold(
+                    y_val.values, y_pred_proba,
+                    min_recall=self.min_recall,
+                    min_precision=self.min_precision
+                )
                 y_pred = (y_pred_proba >= best_threshold).astype(int)
-                
-                score = f1_score(y_val, y_pred)
+
+                # CV score is precision under the recall constraint (primary business goal)
+                score = metrics['precision'] if (metrics['recall'] >= self.min_recall and metrics['precision'] >= self.min_precision) else 0.0
                 scores.append(score)
             
             cv_scores[name] = np.array(scores)
-            print(f"{name}: F1={np.mean(scores):.4f} (+/- {np.std(scores) * 2:.4f})")
+            print(f"{name}: Precision@Recall>={self.min_recall}={np.mean(scores):.4f} (+/- {np.std(scores) * 2:.4f})")
         
         self.cv_scores = cv_scores
         return cv_scores
@@ -579,7 +1179,8 @@ class ModelTrainer:
                          for k, v in self.cv_scores.items()},
             'feature_importance': self.feature_importance,
             'best_thresholds': self.best_thresholds,
-            'min_recall': self.min_recall
+            'min_recall': self.min_recall,
+            'min_precision': self.min_precision
         }
         joblib.dump(metadata, models_dir / 'model_metadata.pkl')
         print(f"Saved model metadata including thresholds to {models_dir / 'model_metadata.pkl'}")

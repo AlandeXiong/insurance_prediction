@@ -5,6 +5,7 @@ from pathlib import Path
 import time
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import roc_auc_score, accuracy_score, precision_score, recall_score, f1_score
 
 from src.utils.config import load_config, get_paths
 from src.utils.logger import setup_logger
@@ -156,58 +157,24 @@ def main():
     logger.info(f"Train target distribution: {y_train.value_counts().to_dict()}")
     logger.info(f"Test target distribution: {y_test.value_counts().to_dict()}")
     
-    # Feature engineering
+    # Feature engineering configuration (used consistently across training/CV/inference)
     logger.info("Starting feature engineering...")
     logger.info("IMPORTANT: Target encoding is DISABLED by default to prevent data leakage")
-    logger.info("This ensures realistic AUC scores (0.75-0.85) instead of unrealistic 0.99+")
-    
-    # Target encoding disabled to prevent leakage in CV
-    # If enabled, it would cause AUC > 0.99 because target encoding leaks in cross-validation
+    logger.info("This ensures realistic AUC scores (0.70-0.85) instead of unrealistic 0.99+")
+
     use_target_encoding = config.get('features', {}).get('use_target_encoding', False)
     if use_target_encoding:
         logger.warning("Target encoding is ENABLED. This may cause data leakage in CV!")
-        logger.warning("Ensure proper out-of-fold encoding is implemented.")
+        logger.warning("Enable it only if you implement proper out-of-fold encoding.")
     else:
         logger.info("Target encoding is DISABLED (safe mode).")
-    
-    feature_engineer = FeatureEngineer(
-        categorical_features=categorical_features,
-        numerical_features=numerical_features,
-        target_column=target_column,
-        use_target_encoding=use_target_encoding
-    )
-    
-    # Fit on training data (pass y_train separately to prevent data leakage)
-    # This ensures target encoding only uses training data, not test data
-    X_train_processed = feature_engineer.transform(X_train, y=y_train, fit=True)
-    
-    # Transform test data (no y needed - uses stored mappings from training)
-    X_test_processed = feature_engineer.transform(X_test, fit=False)
-    
-    logger.info(f"Processed train set: {X_train_processed.shape}")
-    logger.info(f"Processed test set: {X_test_processed.shape}")
-    
-    # Save feature engineer
-    feature_engineer_path = paths['models'] / 'feature_engineer.pkl'
-    
-    # Safety check: Warn if old feature engineer exists with target encoding
-    if feature_engineer_path.exists():
-        import joblib
-        try:
-            old_data = joblib.load(feature_engineer_path)
-            old_use_target = old_data.get('use_target_encoding', False)
-            old_maps = old_data.get('target_encoding_maps', {})
-            if old_use_target or old_maps:
-                logger.warning("="*80)
-                logger.warning("WARNING: Old feature engineer has target encoding enabled or maps exist!")
-                logger.warning("This may cause data leakage. Consider deleting old models.")
-                logger.warning("="*80)
-        except:
-            pass
-    
-    feature_engineer.save(feature_engineer_path)
-    logger.info(f"Feature engineer saved to {feature_engineer_path}")
-    logger.info(f"Target encoding enabled: {use_target_encoding}")
+
+    feature_engineer_kwargs = {
+        "categorical_features": categorical_features,
+        "numerical_features": numerical_features,
+        "target_column": target_column,
+        "use_target_encoding": use_target_encoding,
+    }
     
     # Model training
     logger.info("Starting model training and optimization...")
@@ -237,11 +204,13 @@ def main():
         logger.info(f"  Optimization trials: {n_trials}")
         logger.info(f"  Models: {models_to_train}")
     
-    # Get minimum recall requirement from config
+    # Business constraints
     min_recall = config.get('model', {}).get('min_recall', 0.6)
+    min_precision = config.get('model', {}).get('min_precision', 0.3)
     optimize_threshold = config.get('model', {}).get('optimize_threshold', True)
     
     logger.info(f"Minimum recall requirement: {min_recall}")
+    logger.info(f"Minimum precision requirement: {min_precision}")
     logger.info(f"Threshold optimization: {optimize_threshold}")
     
     trainer = ModelTrainer(
@@ -250,6 +219,7 @@ def main():
         scoring=config['model']['scoring'],
         n_trials=n_trials,
         min_recall=min_recall,
+        min_precision=min_precision,
         optimize_threshold=optimize_threshold
     )
     
@@ -258,17 +228,23 @@ def main():
     # Note: LightGBM has been removed from the system
     # Only XGBoost, CatBoost, and Ensemble are available
     
-    # Create validation set from training data for threshold optimization
-    # This ensures we have a validation set to optimize thresholds
+    # Split BEFORE feature engineering (prevents leakage into validation metrics/thresholds)
     from sklearn.model_selection import train_test_split as tts
-    X_train_fit, X_val_fit, y_train_fit, y_val_fit = tts(
-        X_train_processed, y_train,
+    X_train_fit_raw, X_val_fit_raw, y_train_fit, y_val_fit = tts(
+        X_train, y_train,
         test_size=0.2,
         random_state=config['data']['random_state'],
         stratify=y_train
     )
-    logger.info(f"Training set for model fitting: {X_train_fit.shape}")
-    logger.info(f"Validation set for threshold optimization: {X_val_fit.shape}")
+    logger.info(f"Training set for model fitting (raw): {X_train_fit_raw.shape}")
+    logger.info(f"Validation set for threshold optimization (raw): {X_val_fit_raw.shape}")
+
+    # Fit feature engineering on TRAIN-FIT only, transform TRAIN-FIT and VAL-FIT
+    feature_engineer_tune = FeatureEngineer(**feature_engineer_kwargs)
+    X_train_fit = feature_engineer_tune.transform(X_train_fit_raw, y=y_train_fit, fit=True)
+    X_val_fit = feature_engineer_tune.transform(X_val_fit_raw, fit=False)
+    logger.info(f"Training set for model fitting (processed): {X_train_fit.shape}")
+    logger.info(f"Validation set for threshold optimization (processed): {X_val_fit.shape}")
     
     # All models use the same feature engineering pipeline (already applied)
     # All models will be trained with class weights and threshold optimization
@@ -276,35 +252,125 @@ def main():
     if 'xgboost' in models_to_train:
         logger.info("Training XGBoost...")
         trainer.train_xgboost(X_train_fit, y_train_fit, X_val_fit, y_val_fit, optimize=True)
+
+    if 'lightgbm' in models_to_train:
+        logger.info("Training LightGBM...")
+        trainer.train_lightgbm(X_train_fit, y_train_fit, X_val_fit, y_val_fit, optimize=True)
     
     if 'catboost' in models_to_train:
         logger.info("Training CatBoost...")
-        trainer.train_catboost(X_train_fit, y_train_fit, X_val_fit, y_val_fit, optimize=True)
+        trainer.train_catboost(
+            X_train_fit, y_train_fit, X_val_fit, y_val_fit,
+            optimize=True,
+            cat_feature_names=categorical_features
+        )
     
     if 'ensemble' in models_to_train:
         logger.info("Training Ensemble model...")
         trainer.train_ensemble(
             X_train_fit, y_train_fit, X_val_fit, y_val_fit,
-            method=config['model']['ensemble']['method']
+            method=config['model']['ensemble']['method'],
+            base_models=[m for m in models_to_train if m != "ensemble"]
+        )
+
+    # Fit FINAL feature engineering on FULL TRAIN and transform TRAIN/TEST for final training/inference
+    feature_engineer_final = FeatureEngineer(**feature_engineer_kwargs)
+    X_train_processed = feature_engineer_final.transform(X_train, y=y_train, fit=True)
+    X_test_processed = feature_engineer_final.transform(X_test, fit=False)
+    logger.info(f"Processed train set (final): {X_train_processed.shape}")
+    logger.info(f"Processed test set (final): {X_test_processed.shape}")
+
+    # Save FINAL feature engineer (used by API/inference)
+    feature_engineer_path = paths['models'] / 'feature_engineer.pkl'
+    feature_engineer_final.save(feature_engineer_path)
+    logger.info(f"Feature engineer saved to {feature_engineer_path}")
+    logger.info(f"Target encoding enabled: {use_target_encoding}")
+
+    # Refit final models on FULL training data using best params (Kaggle best practice)
+    logger.info("Refitting final models on full training data with best hyperparameters...")
+    if 'lightgbm' in trainer.best_params:
+        trainer.train_lightgbm(
+            X_train_processed, y_train, None, None,
+            optimize=False,
+            params_override=trainer.best_params['lightgbm']
+        )
+    if 'xgboost' in trainer.best_params:
+        trainer.train_xgboost(
+            X_train_processed, y_train, None, None,
+            optimize=False,
+            params_override=trainer.best_params['xgboost']
+        )
+    if 'catboost' in models_to_train and 'catboost' in trainer.best_params:
+        trainer.train_catboost(
+            X_train_processed, y_train, None, None,
+            optimize=False,
+            cat_feature_names=categorical_features,
+            params_override=trainer.best_params['catboost']
+        )
+    if 'ensemble' in models_to_train:
+        trainer.train_ensemble(
+            X_train_processed, y_train, None, None,
+            method=config['model']['ensemble']['method'],
+            base_models=[m for m in models_to_train if m != "ensemble"]
+        )
+
+    # Fit robust OOF thresholds on RAW training data (feature engineering fit per fold)
+    # IMPORTANT: This also stores fold models + fold feature engineers for bagging inference.
+    models_for_eval = list(trainer.models.keys())
+    logger.info(f"Fitting robust OOF thresholds on training data (leakage-free) for models: {models_for_eval}")
+    oof_threshold_metrics = trainer.fit_oof_thresholds_raw(
+        X_train,
+        y_train,
+        feature_engineer_kwargs=feature_engineer_kwargs,
+        model_names=models_for_eval,
+        cat_feature_names=categorical_features
+    )
+    for m, met in oof_threshold_metrics.items():
+        logger.info(
+            f"OOF threshold for {m}: {met.get('threshold'):.4f} | "
+            f"precision={met.get('precision'):.4f}, recall={met.get('recall'):.4f}, f1={met.get('f1'):.4f}"
         )
     
-    # Cross-validation
-    logger.info("Performing cross-validation...")
-    cv_scores = trainer.cross_validate(X_train_processed, y_train)
+    # Leakage-free cross-validation (feature engineering fit per fold)
+    logger.info("Performing leakage-free cross-validation (feature engineering fit per fold)...")
+    cv_scores = trainer.cross_validate_raw(
+        X_train,
+        y_train,
+        feature_engineer_kwargs=feature_engineer_kwargs,
+        model_names=models_for_eval,
+        cat_feature_names=categorical_features
+    )
     
-    # Evaluate on test set
-    # Re-optimize thresholds on test set to ensure recall requirement is met
-    logger.info("Evaluating models on test set...")
-    logger.info("Re-optimizing thresholds on test set to meet recall requirement...")
-    test_results = trainer.evaluate(X_test_processed, y_test, reoptimize_threshold=True)
-    
-    # Get predictions and probabilities for reporting (using optimal thresholds)
+    # Evaluate on test set (NO test-label leakage)
+    # IMPORTANT:
+    # - Thresholds are selected on TRAIN via OOF predictions.
+    # - Test probabilities must be produced by the SAME fold-bagging process to avoid
+    #   distribution mismatch (otherwise recall may collapse to 0).
+    logger.info("Evaluating models on test set (using OOF-selected thresholds + fold-bagging probabilities)...")
+    test_results = {}
     predictions = {}
     probabilities = {}
-    for model_name, model in trainer.models.items():
-        proba = model.predict_proba(X_test_processed)[:, 1]
+    for model_name in models_for_eval:
+        # Bagged probabilities from fold models
+        proba = trainer.predict_proba_bagged_raw(X_test, model_name)
         threshold = trainer.best_thresholds.get(model_name, 0.5)
-        predictions[model_name] = (proba >= threshold).astype(int)
+        y_pred = (proba >= threshold).astype(int)
+        y_pred_default = (proba >= 0.5).astype(int)
+
+        test_results[model_name] = {
+            "roc_auc": roc_auc_score(y_test, proba),
+            "accuracy": accuracy_score(y_test, y_pred),
+            "precision": precision_score(y_test, y_pred, zero_division=0),
+            "recall": recall_score(y_test, y_pred),
+            "f1": f1_score(y_test, y_pred),
+            "threshold": float(threshold),
+            "accuracy_default": accuracy_score(y_test, y_pred_default),
+            "precision_default": precision_score(y_test, y_pred_default, zero_division=0),
+            "recall_default": recall_score(y_test, y_pred_default),
+            "f1_default": f1_score(y_test, y_pred_default),
+        }
+
+        predictions[model_name] = y_pred
         probabilities[model_name] = proba
     
     # Generate comprehensive report
@@ -320,7 +386,9 @@ def main():
         feature_importance=trainer.feature_importance,
         cv_scores=cv_scores,
         test_results=test_results,
-        training_time=training_time
+        training_time=training_time,
+        cv_metric_name=f"Precision@Recall>={min_recall}",
+        best_model_metric="roc_auc"
     )
     
     # Generate visualizations

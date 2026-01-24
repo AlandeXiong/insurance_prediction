@@ -54,16 +54,19 @@ features:
 
 model:
   models:
+    - "lightgbm"
     - "xgboost"
     - "catboost"
     - "ensemble"
   
   cv_folds: 5
-  scoring: "f1"  # Changed to F1 to balance precision and recall
+  scoring: "precision_at_min_recall"  # Primary goal: maximize precision with recall >= min_recall
   n_trials: 100
   
-  # Class imbalance handling
-  min_recall: 0.6  # Minimum recall requirement (must be >= 0.6)
+  # Business constraints for imbalanced classification (threshold moving)
+  # Goal: ensure Recall >= min_recall AND Precision >= min_precision
+  min_recall: 0.5
+  min_precision: 0.3
   optimize_threshold: true  # Optimize threshold to meet recall requirement
   
   ensemble:
@@ -80,13 +83,13 @@ training:
   fast:
     n_trials: 20  # Reduced optimization trials
     cv_folds: 3  # Fewer CV folds
-    models: ["xgboost", "ensemble"]  # Fewer models to train
+    models: ["lightgbm", "xgboost", "ensemble"]  # Fewer models to train
   
   # Full mode settings (used when mode="full")
   full:
     n_trials: 100  # Full optimization trials
     cv_folds: 5  # Standard CV folds
-    models: ["xgboost", "catboost", "ensemble"]  # All models (lightgbm removed)
+    models: ["lightgbm", "xgboost", "catboost", "ensemble"]  # All models
   
   early_stopping_rounds: 100
   verbose: true

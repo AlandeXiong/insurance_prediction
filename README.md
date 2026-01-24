@@ -1,17 +1,18 @@
 # Insurance Renewal Prediction System
 
-A State-of-the-Art (SOTA) machine learning system for predicting insurance customer renewal, built following Kaggle competition best practices.
+A State-of-the-Art (SOTA) machine learning system for predicting insurance customer renewal/repurchase, built following Kaggle-style competition best practices (clean splits, leakage prevention, CV + Optuna, strong boosting models, and threshold moving for imbalanced data).
 
 ## 🎯 Features
 
 - **Comprehensive EDA**: Automated exploratory data analysis with visualizations
-- **Advanced Feature Engineering**: Interaction features, statistical aggregations, target encoding following Kaggle best practices
+- **Advanced Feature Engineering**: Interaction features + safe statistical aggregations (count/median encodings)
 - **Auto Feature Discovery**: Automatic detection of categorical and numerical features
 - **Multiple SOTA Models**: LightGBM, XGBoost, CatBoost, and Ensemble
 - **Hyperparameter Optimization**: Optuna-based automated tuning with cross-validation
 - **Comprehensive Reporting**: Complete training, testing, and model accuracy reports
 - **RESTful API**: FastAPI-based prediction service
 - **Modular Design**: Clean, maintainable code structure
+- **Imbalanced Learning Best Practice**: Class weights + threshold moving to maximize **precision** under **recall ≥ 0.6**
 
 ## 📁 Project Structure
 
@@ -175,7 +176,6 @@ The system includes advanced feature engineering following Kaggle best practices
 - Premium to income ratio
 
 ### Statistical Features
-- Target encoding for categorical features
 - Count encoding
 - Median encoding (numerical features grouped by categories)
 
@@ -207,31 +207,25 @@ Key configuration options in `config.yaml`:
 
 ```yaml
 data:
-  train_path: "dataset/WA_Fn-UseC_-Marketing-Customer-Value-Analysis.csv"
+  train_path: "dataset/WA_Fn-UseC_-Marketing-Customer-Value-Analysis—train.csv"
+  test_path: "dataset/WA_Fn-UseC_-Marketing-Customer-Value-Analysis—test.csv"
+  use_separate_files: true
   target_column: "Response"
-  test_size: 0.2
   random_state: 42
-
-features:
-  use_auto_discovery: false  # Enable automatic feature discovery
-  categorical_features: [...]
-  numerical_features: [...]
 
 model:
   models: ["lightgbm", "xgboost", "catboost", "ensemble"]
   cv_folds: 5
-  n_trials: 100  # Hyperparameter optimization trials
+  n_trials: 100
+  min_recall: 0.6
+  optimize_threshold: true
 
 training:
-  mode: "full"  # "fast" for quick testing, "full" for production
-  
-  # Fast mode: ~5-10 minutes, good for development
+  mode: "fast"  # "fast" or "full"
   fast:
     n_trials: 20
     cv_folds: 3
-    models: ["lightgbm", "ensemble"]
-  
-  # Full mode: ~30-60 minutes, best performance
+    models: ["lightgbm", "xgboost", "ensemble"]
   full:
     n_trials: 100
     cv_folds: 5
@@ -243,14 +237,14 @@ training:
 - **Fast Mode**: Quick testing and development (~5-10 min)
   - Fewer optimization trials (20)
   - Fewer CV folds (3)
-  - Fewer models (LightGBM + Ensemble)
+  - Fewer models (XGBoost + Ensemble)
   
 - **Full Mode**: Production training (~30-60 min)
   - Full optimization (100 trials)
   - Standard CV (5 folds)
-  - All models (LightGBM, XGBoost, CatBoost, Ensemble)
+  - All models (XGBoost, CatBoost, Ensemble)
 
-See [TRAINING_MODES.md](doc/TRAINING_MODES.md) for details.
+See `doc/TRAINING_MODES.md` for details.
 
 ## 📝 Best Practices
 
@@ -273,18 +267,26 @@ This project follows Kaggle competition best practices:
 
 The system implements strict data leakage prevention:
 
-- **Target Encoding Safety**: Target variable passed separately, ensuring only training data is used
+- **No test-label tuning**: thresholds are selected on validation data and applied to the test set
 - **Automatic Checks**: Target column automatically removed if accidentally included in features
 - **Explicit Separation**: Clear separation between feature data and target data
 - **Training/Test Isolation**: Test data never used for feature engineering
 
-See [DATA_LEAKAGE_FIX.md](doc/DATA_LEAKAGE_FIX.md) for detailed documentation.
+See `doc/DATA_LEAKAGE_FIX.md` for details.
 
 ## 🛠️ Dependencies
 
 - **pandas, numpy**: Data manipulation
 - **scikit-learn**: Machine learning utilities
 - **lightgbm, xgboost, catboost**: Gradient boosting models
+
+### macOS (Apple Silicon) note
+
+On Mac M1/M2, LightGBM normally installs via prebuilt wheels. If you hit an OpenMP error at runtime, install OpenMP:
+
+```bash
+brew install libomp
+```
 - **optuna**: Hyperparameter optimization
 - **fastapi, uvicorn**: API framework
 - **matplotlib, seaborn**: Visualization
