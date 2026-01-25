@@ -3,10 +3,11 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 import time
-from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     roc_auc_score,
+    average_precision_score,
     accuracy_score,
     balanced_accuracy_score,
     precision_score,
@@ -98,10 +99,50 @@ def main():
     # 4.1 Encode target - fit on training data only
     le_target = LabelEncoder()
 
-    # Process training data
-    df_train[target_column] = le_target.fit_transform(df_train[target_column])
+    # Determine threshold strategy
+    model_cfg = config.get('model', {}) or {}
+    threshold_strategy = str(model_cfg.get('threshold_strategy', 'fixed')).lower().strip()
+
+    # Internal validation split (used for threshold selection when threshold_strategy="validation")
+    df_train_fit = df_train.copy()
+    df_val_fit = None
+    if threshold_strategy == 'validation':
+        val_cfg = (config.get('training', {}) or {}).get('validation', {}) or {}
+        val_strategy = str(val_cfg.get('strategy', 'auto')).lower().strip()
+        val_size = float(val_cfg.get('holdout_size', 0.2))
+        date_col = str(val_cfg.get('date_col', 'Effective To Date'))
+
+        def stratified_split_fallback():
+            return train_test_split(
+                df_train.copy(),
+                test_size=val_size,
+                random_state=config['data']['random_state'],
+                stratify=df_train[target_column],
+            )
+
+        if (val_strategy in {'auto', 'time_holdout'} and date_col in df_train_fit.columns):
+            dt = pd.to_datetime(df_train_fit[date_col], errors='coerce')
+            df_train_fit = df_train_fit.assign(_dt=dt).sort_values('_dt').drop(columns=['_dt'])
+            split_idx = int(round((1.0 - val_size) * len(df_train_fit)))
+            split_idx = min(max(split_idx, 1), len(df_train_fit) - 1)
+            df_val_fit = df_train_fit.iloc[split_idx:].copy()
+            df_train_fit = df_train_fit.iloc[:split_idx].copy()
+            # If time split produces single-class validation, fall back to stratified random split.
+            if df_val_fit[target_column].nunique() < 2:
+                logger.warning("Time-holdout validation produced single-class validation; falling back to stratified holdout.")
+                df_train_fit, df_val_fit = stratified_split_fallback()
+        else:
+            df_train_fit, df_val_fit = stratified_split_fallback()
+
+        logger.info(f"Validation split: train_fit={df_train_fit.shape}, val_fit={df_val_fit.shape}")
+
+    # Process training data (fit encoder on train_fit only)
+    df_train_fit[target_column] = le_target.fit_transform(df_train_fit[target_column])
     target_mapping = dict(zip(le_target.classes_, range(len(le_target.classes_))))
     logger.info(f"Target encoding (fitted on train): {target_mapping}")
+
+    if df_val_fit is not None:
+        df_val_fit[target_column] = le_target.transform(df_val_fit[target_column])
 
     # Process test data using same encoder
     # Handle unseen labels in test set
@@ -133,39 +174,70 @@ def main():
     # 4.2 Process the X data
     # Drop unnecessary columns
     drop_cols = config['features'].get('drop_features', [])
-    df_train = df_train.drop(columns=[col for col in drop_cols if col in df_train.columns])
+    # If enabled, keep 'Effective To Date' for feature generation (month/day/weekday),
+    # and drop the raw date column inside FeatureEngineer after deriving features.
+    date_cfg = (config.get('features', {}) or {}).get('date_features', {}) or {}
+    eff_cfg = (date_cfg.get('effective_to_date', {}) or {})
+    eff_enabled = bool(eff_cfg.get('enabled', False))
+    if eff_enabled and 'Effective To Date' in drop_cols:
+        drop_cols = [c for c in drop_cols if c != 'Effective To Date']
+    df_train_fit = df_train_fit.drop(columns=[col for col in drop_cols if col in df_train_fit.columns])
+    if df_val_fit is not None:
+        df_val_fit = df_val_fit.drop(columns=[col for col in drop_cols if col in df_val_fit.columns])
     df_test = df_test.drop(columns=[col for col in drop_cols if col in df_test.columns])
 
     # Split into X and y
-    X_train = df_train.drop(columns=[target_column])
-    y_train = df_train[target_column]
+    X_train = df_train_fit.drop(columns=[target_column])
+    y_train = df_train_fit[target_column]
+    X_val = None
+    y_val = None
+    if df_val_fit is not None:
+        X_val = df_val_fit.drop(columns=[target_column])
+        y_val = df_val_fit[target_column]
     X_test = df_test.drop(columns=[target_column])
     y_test = df_test[target_column]
 
     logger.info(f"Train set: {X_train.shape}, Test set: {X_test.shape}")
     logger.info(f"Train target distribution: {y_train.value_counts().to_dict()}")
     logger.info(f"Test target distribution: {y_test.value_counts().to_dict()}")
+    if X_val is not None and y_val is not None:
+        logger.info(f"Validation set: {X_val.shape}")
+        logger.info(f"Validation target distribution: {y_val.value_counts().to_dict()}")
 
 
     # NOTE ABOUT FEATURE ENGINEERING (IMPORTANT)
-    # This training pipeline uses feature engineering in two "fit scopes":
+    # This pipeline runs ONE unified feature engineering fit:
+    # - Fit FeatureEngineer on FULL training set once
+    # - Transform both train and test using the same fitted FeatureEngineer
     #
-    # 1) TUNING / MODEL SELECTION scope (CV/OOF on RAW):
-    #    - We DO NOT create an extra fixed holdout split (to avoid wasting data on small datasets).
-    #    - During hyperparameter tuning (Optuna) and threshold fitting (OOF),
-    #      feature engineering is fit per fold on RAW data to prevent leakage.
-    #
-    # 2) FINAL / INFERENCE scope (full train / test):
-    #    - We fit a FeatureEngineer on the FULL training set, then transform train and test.
-    #    - We save this FeatureEngineer to disk for API/inference to guarantee consistent preprocessing.
+    # This is faster (especially in FAST mode) because we do not refit / re-transform
+    # features inside every training loop. Thresholds are NOT auto-searched; they come from config.yaml.
     feature_engineer_kwargs = {
         "categorical_features": categorical_features,
         "numerical_features": numerical_features,
         "target_column": target_column,
     }
 
-    # Model training (tuning / selection) is performed via CV/OOF on RAW data
-    # (feature engineering fit per fold inside trainer routines).
+    # Fit feature engineering ONCE (fit on train_fit only)
+    feature_engineer_final = FeatureEngineer(
+        **feature_engineer_kwargs,
+        drop_effective_to_date_original=bool(eff_cfg.get('drop_original', True)) if eff_enabled else True,
+    )
+    X_train_processed = feature_engineer_final.transform(X_train, y=y_train, fit=True)
+    X_val_processed = None
+    if X_val is not None:
+        X_val_processed = feature_engineer_final.transform(X_val, fit=False)
+    X_test_processed = feature_engineer_final.transform(X_test, fit=False)
+    logger.info(f"Processed train set: {X_train_processed.shape}")
+    if X_val_processed is not None:
+        logger.info(f"Processed validation set: {X_val_processed.shape}")
+    logger.info(f"Processed test set: {X_test_processed.shape}")
+
+    # Save feature engineer (used by API/inference)
+    feature_engineer_path = paths['models'] / 'feature_engineer.pkl'
+    feature_engineer_final.save(feature_engineer_path)
+    logger.info(f"Feature engineer saved to {feature_engineer_path}")
+
     logger.info("Starting model training and optimization...")
 
     # Determine training mode (fast or full)
@@ -178,10 +250,30 @@ def main():
         cv_folds = fast_config.get('cv_folds', 3)
         n_trials = fast_config.get('n_trials', 20)
         models_to_train = fast_config.get('models', ['xgboost', 'ensemble'])
+        # Fast tuning: single holdout split + smaller iteration budgets (2x+ speed)
+        tuning_cfg = fast_config.get('tuning', {}) or {}
+        tuning_strategy = str(tuning_cfg.get('strategy', 'holdout')).lower().strip()
+        use_holdout_tuning = tuning_strategy == 'holdout'
+        holdout_size = float(tuning_cfg.get('holdout_size', 0.2))
+        tuning_early_stopping_rounds = int(tuning_cfg.get('early_stopping_rounds', 30))
+        tuning_lgb_n_estimators = int(tuning_cfg.get('lightgbm_n_estimators', 800))
+        tuning_xgb_n_estimators = int(tuning_cfg.get('xgboost_n_estimators', 600))
+        tuning_cat_iterations = int(tuning_cfg.get('catboost_iterations', 600))
+        tuning_cat_od_wait = int(tuning_cfg.get('catboost_od_wait', 30))
         logger.info("FAST MODE: Using reduced settings for quick training")
         logger.info(f"  CV folds: {cv_folds} (reduced from {config['model']['cv_folds']})")
         logger.info(f"  Optimization trials: {n_trials} (reduced from {config['model']['n_trials']})")
         logger.info(f"  Models: {models_to_train} (reduced set)")
+        logger.info(
+            f"  Tuning strategy: {'holdout' if use_holdout_tuning else 'kfold'} | "
+            f"holdout_size={holdout_size} | "
+            f"early_stopping_rounds={tuning_early_stopping_rounds}"
+        )
+        logger.info(
+            f"  Tuning budgets: lgb_n_estimators={tuning_lgb_n_estimators}, "
+            f"xgb_n_estimators={tuning_xgb_n_estimators}, "
+            f"cat_iterations={tuning_cat_iterations}"
+        )
     else:
         # Full mode: standard settings for best performance
         full_config = config['training'].get('full', {})
@@ -195,15 +287,26 @@ def main():
 
     # Step5 Model Training
 
-    min_recall = config.get('model', {}).get('min_recall', 0.5)
-    min_precision = config.get('model', {}).get('min_precision', 0.3)
-    optimize_threshold = config.get('model', {}).get('optimize_threshold', True)
-    threshold_selection = config.get('model', {}).get('threshold_selection', 'max_precision')
+    min_recall = float(config.get('model', {}).get('min_recall', 0.5))
+    # When not configured, default min_precision to 0.0 (only enforce recall)
+    min_precision = float(config.get('model', {}).get('min_precision', 0.0) or 0.0)
+
+    # Threshold selection: validation-based or fixed from config
+    optimize_threshold_cfg = bool(config.get('model', {}).get('optimize_threshold', False))
+    optimize_threshold = bool(optimize_threshold_cfg or (threshold_strategy == 'validation' and X_val_processed is not None))
+    thresholds_cfg = config.get('model', {}).get('thresholds', {}) or {}
+    default_threshold = float(thresholds_cfg.get('default', 0.5))
+    model_thresholds = {
+        k: float(v) for k, v in thresholds_cfg.items()
+        if k not in {'default'} and v is not None
+    }
 
     logger.info(f"Minimum recall requirement: {min_recall}")
     logger.info(f"Minimum precision requirement: {min_precision}")
-    logger.info(f"Threshold optimization: {optimize_threshold}")
-    logger.info(f"Threshold selection strategy: {threshold_selection}")
+    logger.info(f"Threshold strategy: {threshold_strategy}")
+    logger.info(f"Threshold optimization (auto-search): {optimize_threshold} (config={optimize_threshold_cfg})")
+    logger.info(f"Default threshold: {default_threshold}")
+    logger.info(f"Per-model thresholds: {model_thresholds}")
 
     trainer = ModelTrainer(
         cv_folds=cv_folds,
@@ -213,7 +316,8 @@ def main():
         min_recall=min_recall,
         min_precision=min_precision,
         optimize_threshold=optimize_threshold,
-        threshold_selection=threshold_selection
+        thresholds=model_thresholds,
+        default_threshold=default_threshold,
     )
 
     logger.info(f"Training {len(models_to_train)} model(s): {models_to_train}")
@@ -222,125 +326,159 @@ def main():
     # All models will be trained with class weights and threshold optimization
 
 
-    # 5.1 Hyperparameter optimization (no extra holdout split; CV + per-fold feature engineering on RAW)
-    if 'xgboost' in models_to_train:
-        logger.info("Optimizing XGBoost (CV on raw + per-fold feature engineering)...")
-        trainer.best_params['xgboost'] = trainer.optimize_xgboost_raw(
-            X_train,
-            y_train,
-            feature_engineer_kwargs=feature_engineer_kwargs,
-        )
-
+    # 5.1 Hyperparameter optimization + final fit on FULL processed training data
+    # Thresholds are NOT auto-searched; they are controlled via config.yaml.
     if 'lightgbm' in models_to_train:
-        logger.info("Optimizing LightGBM (CV on raw + per-fold feature engineering)...")
-        trainer.best_params['lightgbm'] = trainer.optimize_lightgbm_raw(
-            X_train,
+        logger.info("Optimizing + training LightGBM on processed features...")
+        trainer.best_params['lightgbm'] = trainer.optimize_lightgbm(
+            X_train_processed,
             y_train,
-            feature_engineer_kwargs=feature_engineer_kwargs,
+            use_holdout=bool(use_holdout_tuning) if training_mode == 'fast' else False,
+            holdout_size=float(holdout_size) if training_mode == 'fast' else 0.2,
+            tuning_n_estimators=int(tuning_lgb_n_estimators) if training_mode == 'fast' else 800,
+            tuning_early_stopping_rounds=int(tuning_early_stopping_rounds) if training_mode == 'fast' else 30,
         )
-
-    if 'catboost' in models_to_train:
-        logger.info("Optimizing CatBoost (CV on raw + per-fold feature engineering)...")
-        trainer.best_params['catboost'] = trainer.optimize_catboost_raw(
-            X_train,
-            y_train,
-            feature_engineer_kwargs=feature_engineer_kwargs,
-            cat_feature_names=categorical_features,
-        )
-
-    # 5.2 Fit FINAL feature engineering on FULL TRAIN and transform TRAIN/TEST for final training/inference
-    # NOTE: This is the SECOND scope described above (final/inference scope).
-    feature_engineer_final = FeatureEngineer(**feature_engineer_kwargs)
-    X_train_processed = feature_engineer_final.transform(X_train, y=y_train, fit=True)
-    X_test_processed = feature_engineer_final.transform(X_test, fit=False)
-    logger.info(f"Processed train set (final): {X_train_processed.shape}")
-    logger.info(f"Processed test set (final): {X_test_processed.shape}")
-
-    # Save FINAL feature engineer (used by API/inference)
-    feature_engineer_path = paths['models'] / 'feature_engineer.pkl'
-    feature_engineer_final.save(feature_engineer_path)
-    logger.info(f"Feature engineer saved to {feature_engineer_path}")
-
-    # 5.3 First Refit final models
-    # Refit final models on FULL training data using best params (Kaggle best practice)
-    logger.info("Refitting final models on full training data with best hyperparameters...")
-    if 'lightgbm' in trainer.best_params:
         trainer.train_lightgbm(
-            X_train_processed, y_train, None, None,
+            X_train_processed, y_train, X_val_processed, y_val,
             optimize=False,
             params_override=trainer.best_params['lightgbm']
         )
-    if 'xgboost' in trainer.best_params:
+
+    if 'xgboost' in models_to_train:
+        logger.info("Optimizing + training XGBoost on processed features...")
+        trainer.best_params['xgboost'] = trainer.optimize_xgboost(
+            X_train_processed,
+            y_train,
+            use_holdout=bool(use_holdout_tuning) if training_mode == 'fast' else False,
+            holdout_size=float(holdout_size) if training_mode == 'fast' else 0.2,
+            tuning_n_estimators=int(tuning_xgb_n_estimators) if training_mode == 'fast' else 600,
+            tuning_early_stopping_rounds=int(tuning_early_stopping_rounds) if training_mode == 'fast' else 30,
+        )
         trainer.train_xgboost(
-            X_train_processed, y_train, None, None,
+            X_train_processed, y_train, X_val_processed, y_val,
             optimize=False,
             params_override=trainer.best_params['xgboost']
         )
-    if 'catboost' in models_to_train and 'catboost' in trainer.best_params:
+
+    if 'catboost' in models_to_train:
+        logger.info("Optimizing + training CatBoost on processed features...")
+        trainer.best_params['catboost'] = trainer.optimize_catboost(
+            X_train_processed,
+            y_train,
+            cat_feature_names=categorical_features,
+            use_holdout=bool(use_holdout_tuning) if training_mode == 'fast' else False,
+            holdout_size=float(holdout_size) if training_mode == 'fast' else 0.2,
+            tuning_iterations=int(tuning_cat_iterations) if training_mode == 'fast' else 600,
+            tuning_od_wait=int(tuning_cat_od_wait) if training_mode == 'fast' else 30,
+        )
         trainer.train_catboost(
-            X_train_processed, y_train, None, None,
+            X_train_processed, y_train, X_val_processed, y_val,
             optimize=False,
             cat_feature_names=categorical_features,
             params_override=trainer.best_params['catboost']
         )
+
     if 'ensemble' in models_to_train:
+        logger.info("Training Ensemble model...")
         trainer.train_ensemble(
-            X_train_processed, y_train, None, None,
+            X_train_processed, y_train, X_val_processed, y_val,
             method=config['model']['ensemble']['method'],
             base_models=[m for m in models_to_train if m != "ensemble"]
         )
 
-    # 5.4 Fit robust OOF thresholds on RAW training data (feature engineering fit per fold)
-    # IMPORTANT: This also stores fold models + fold feature engineers for bagging inference.
-    models_for_eval = list(trainer.models.keys())
-    logger.info(f"Fitting robust OOF thresholds on training data (leakage-free) for models: {models_for_eval}")
-    oof_threshold_metrics = trainer.fit_oof_thresholds_raw(
-        X_train,
-        y_train,
-        feature_engineer_kwargs=feature_engineer_kwargs,
-        model_names=models_for_eval,
-        cat_feature_names=categorical_features
-    )
-    for m, met in oof_threshold_metrics.items():
-        logger.info(
-            f"OOF threshold for {m}: {met.get('threshold'):.4f} | "
-            f"precision={met.get('precision'):.4f}, recall={met.get('recall'):.4f}, f1={met.get('f1'):.4f}"
+    # Optional CV reporting (skip in FAST mode for speed)
+    if training_mode == 'fast':
+        cv_scores = {}
+    else:
+        cv_scores = trainer.cross_validate(X_train_processed, y_train)
+
+    # Step6 Select BEST MODEL (avoid selecting on test set)
+    model_cfg = config.get('model', {}) or {}
+    best_model_metric = str(model_cfg.get('best_model_metric', 'business_score')).lower().strip()
+    best_model_selection_dataset = str(model_cfg.get('best_model_selection_dataset', 'validation')).lower().strip()
+    best_model_fallback_metric = str(model_cfg.get('best_model_fallback_metric', 'pr_auc')).lower().strip()
+
+    def _eval_binary_metrics(y_true_arr: np.ndarray, proba_arr: np.ndarray, threshold_val: float) -> dict:
+        y_pred_arr = (proba_arr >= float(threshold_val)).astype(int)
+        prec = float(precision_score(y_true_arr, y_pred_arr, zero_division=0))
+        rec = float(recall_score(y_true_arr, y_pred_arr))
+        business = prec if (rec >= float(min_recall) and prec >= float(min_precision)) else 0.0
+        return {
+            "roc_auc": float(roc_auc_score(y_true_arr, proba_arr)),
+            "pr_auc": float(average_precision_score(y_true_arr, proba_arr)),
+            "accuracy": float(accuracy_score(y_true_arr, y_pred_arr)),
+            "balanced_accuracy": float(balanced_accuracy_score(y_true_arr, y_pred_arr)),
+            "precision": prec,
+            "recall": rec,
+            "f1": float(f1_score(y_true_arr, y_pred_arr)),
+            "business_score": float(business),
+            "threshold": float(threshold_val),
+        }
+
+    selection_results = {}
+    selection_best_model = None
+    selection_best_value = None
+    selection_source = None
+
+    if best_model_selection_dataset == "validation" and X_val_processed is not None and y_val is not None:
+        logger.info("Selecting BEST MODEL on validation set (to avoid test-set model selection)...")
+        selection_source = "validation"
+        for model_name in list(trainer.models.keys()):
+            proba_val = trainer.models[model_name].predict_proba(X_val_processed)[:, 1]
+            thr = float(trainer.best_thresholds.get(model_name, trainer.default_threshold))
+            selection_results[model_name] = _eval_binary_metrics(y_val.values, proba_val, thr)
+
+        # Primary: use configured metric; if business_score and none satisfy constraints, fall back.
+        if best_model_metric == "business_score":
+            feasible = {k: v for k, v in selection_results.items() if float(v.get("business_score", 0.0)) > 0.0}
+            pool = feasible if feasible else selection_results
+            metric_for_rank = "business_score" if feasible else best_model_fallback_metric
+        else:
+            pool = selection_results
+            metric_for_rank = best_model_metric
+
+        selection_best_model = max(
+            pool.keys(),
+            key=lambda m: float(pool[m].get(metric_for_rank, pool[m].get("roc_auc", 0.0))),
+        ) if pool else None
+        selection_best_value = float(pool[selection_best_model].get(metric_for_rank, 0.0)) if selection_best_model else None
+
+        if best_model_metric == "business_score" and not any(float(v.get("business_score", 0.0)) > 0.0 for v in selection_results.values()):
+            logger.warning(
+                "No model satisfied constraints on validation set "
+                f"(precision>={min_precision}, recall>={min_recall}). "
+                f"Falling back to metric='{metric_for_rank}' for BEST MODEL selection."
+            )
+    else:
+        selection_source = "test"
+        logger.warning(
+            "BEST MODEL selection will fall back to test-set metrics "
+            f"(selection_dataset='{best_model_selection_dataset}', val_available={X_val_processed is not None}). "
+            "For leakage-free evaluation, set model.best_model_selection_dataset='validation' and enable validation split."
         )
 
-    # 5.5 Leakage-free cross-validation (feature engineering fit per fold)
-    logger.info("Performing leakage-free cross-validation (feature engineering fit per fold)...")
-    cv_scores = trainer.cross_validate_raw(
-        X_train,
-        y_train,
-        feature_engineer_kwargs=feature_engineer_kwargs,
-        model_names=models_for_eval,
-        cat_feature_names=categorical_features
-    )
-
-    # Step6 Evaluate models on the test set
-    # Evaluate on a test set (NO test-label leakage)
-    # IMPORTANT:
-    # - Thresholds are selected on TRAIN via OOF predictions.
-    # - Test probabilities must be produced by the SAME fold-bagging process to avoid
-    #   distribution mismatch (otherwise recall may collapse to 0).
-    logger.info("Evaluating models on test set (using OOF-selected thresholds + fold-bagging probabilities)...")
+    # Step7 Evaluate models on the test set (final holdout evaluation)
+    logger.info("Evaluating models on test set (using config thresholds)...")
     test_results = {}
     predictions = {}
     probabilities = {}
+    models_for_eval = list(trainer.models.keys())
     for model_name in models_for_eval:
-        # Bagged probabilities from fold models
-        proba = trainer.predict_proba_bagged_raw(X_test, model_name)
-        threshold = trainer.best_thresholds.get(model_name, 0.5)
+        proba = trainer.models[model_name].predict_proba(X_test_processed)[:, 1]
+        threshold = float(trainer.best_thresholds.get(model_name, trainer.default_threshold))
         y_pred = (proba >= threshold).astype(int)
         y_pred_default = (proba >= 0.5).astype(int)
-        # Business score: precision under the recall constraint (recall >= min_recall).
-        # This avoids selecting models that look good on ROC-AUC but fail the business operating point.
-        precision_at_constraint = precision_score(y_test, y_pred, zero_division=0)
-        recall_at_constraint = recall_score(y_test, y_pred)
-        business_score = float(precision_at_constraint) if float(recall_at_constraint) >= float(min_recall) else 0.0
+        # Business score (strict): precision at the operating point ONLY if constraints are satisfied.
+        # Constraints: recall >= min_recall AND precision >= min_precision
+        precision_at_threshold = float(precision_score(y_test, y_pred, zero_division=0))
+        recall_at_threshold = float(recall_score(y_test, y_pred))
+        business_score = float(precision_at_threshold) if (
+            recall_at_threshold >= float(min_recall) and precision_at_threshold >= float(min_precision)
+        ) else 0.0
 
         test_results[model_name] = {
             "roc_auc": roc_auc_score(y_test, proba),
+            "pr_auc": average_precision_score(y_test, proba),
             "accuracy": accuracy_score(y_test, y_pred),
             # Balanced accuracy is more informative than accuracy on imbalanced data.
             "balanced_accuracy": balanced_accuracy_score(y_test, y_pred),
@@ -374,8 +512,15 @@ def main():
         cv_scores=cv_scores,
         test_results=test_results,
         training_time=training_time,
-        cv_metric_name=f"Precision@Recall>={min_recall}",
-        best_model_metric="business_score"
+        cv_metric_name=str(config['model']['scoring']),
+        best_model_metric=best_model_metric,
+        best_model_override=selection_best_model,
+        best_model_selection={
+            "dataset": selection_source,
+            "metric": best_model_metric,
+            "fallback_metric": best_model_fallback_metric,
+            "value": selection_best_value,
+        },
     )
 
     # Generate visualizations
@@ -391,7 +536,8 @@ def main():
         top_n=20
     )
 
-    report_generator.generate_cv_comparison_plot(cv_scores)
+    if cv_scores:
+        report_generator.generate_cv_comparison_plot(cv_scores)
 
     # Generate text summary
     summary_report = report_generator.generate_summary_report()
@@ -410,13 +556,15 @@ def main():
 
     # Final summary
     best_model = training_report['best_model']
-    best_auc = test_results[best_model]['roc_auc'] if best_model else 0
+    best_auc = float(test_results[best_model]['roc_auc']) if best_model else 0.0
+    best_pr_auc = float(test_results[best_model].get('pr_auc', 0.0)) if best_model else 0.0
+    best_business = float(test_results[best_model].get('business_score', 0.0)) if best_model else 0.0
 
     logger.info("=" * 80)
     logger.info("Training pipeline completed successfully!")
     logger.info(f"Total training time: {training_time / 60:.2f} minutes ({training_time:.2f} seconds)")
-    logger.info(f"Best model: {best_model}")
-    logger.info(f"Best test ROC-AUC: {best_auc:.4f}")
+    logger.info(f"Best model: {best_model} (selected_on={selection_source}, metric={best_model_metric})")
+    logger.info(f"Best test ROC-AUC: {best_auc:.4f} | PR-AUC: {best_pr_auc:.4f} | Business_score: {best_business:.4f}")
     logger.info(f"Reports saved to: {report_dir}")
     logger.info(f"Models saved to: {paths['models']}")
     logger.info("=" * 80)

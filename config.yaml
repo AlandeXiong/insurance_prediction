@@ -1,9 +1,29 @@
 # Configuration file for Insurance Renewal Prediction
 
 data:
-  # Paths for separate train and test files
-  train_path: "dataset/WA_Fn-UseC_-Marketing-Customer-Value-Analysis—train.csv"
-  test_path: "dataset/WA_Fn-UseC_-Marketing-Customer-Value-Analysis—test.csv"
+  # Dataset split strategy switch:
+  # - Set `active_split` to choose which generated train/test files to use.
+  # - Each split strategy MUST write separate train/test files to disk (see scripts/).
+  source_path: "dataset/WA_Fn-UseC_-Marketing-Customer-Value-Analysis.csv"
+  active_split: "timecut"  # "timecut" or "ratio"
+  splits:
+    # Strategy 1: split by Effective To Date cutoff (time-based)
+    timecut:
+      train_path: "dataset/WA_Fn-UseC_-Marketing-Customer-Value-Analysis—train_timecut.csv"
+      test_path: "dataset/WA_Fn-UseC_-Marketing-Customer-Value-Analysis—test_timecut.csv"
+      date_col: "Effective To Date"
+      cutoff: "2011-02-20"  # dates <= cutoff go to train
+    # Strategy 2: split by ratio (random split, optional stratification)
+    ratio:
+      train_path: "dataset/WA_Fn-UseC_-Marketing-Customer-Value-Analysis—train_ratio.csv"
+      test_path: "dataset/WA_Fn-UseC_-Marketing-Customer-Value-Analysis—test_ratio.csv"
+      test_size: 0.2
+      random_state: 42
+      stratify: true
+
+  # Backward-compatible fields (will be overridden by active_split if provided)
+  train_path: "dataset/WA_Fn-UseC_-Marketing-Customer-Value-Analysis—train_timecut.csv"
+  test_path: "dataset/WA_Fn-UseC_-Marketing-Customer-Value-Analysis—test_timecut.csv"
   
   # If train_path and test_path are provided, they will be used
   # Otherwise, single file will be split using test_size
@@ -47,6 +67,15 @@ features:
     - "Customer"
     - "Effective To Date"
 
+  # Date-derived features (recommended for time-based evaluation/generalization)
+  # When enabled, we keep 'Effective To Date' long enough to derive:
+  # - Effective_To_Date_Month / Day / Weekday / Quarter
+  # Then we drop the raw 'Effective To Date' column from the final model matrix.
+  date_features:
+    effective_to_date:
+      enabled: true
+      drop_original: true
+
 model:
   models:
     - "lightgbm"
@@ -55,23 +84,35 @@ model:
     - "ensemble"
   
   cv_folds: 5
-  scoring: "precision_at_min_recall"  # Primary goal: maximize precision with recall >= min_recall
+  # CV scoring metric used during Optuna tuning and optional CV reporting.
+  # For imbalanced data, prefer "average_precision" or "roc_auc".
+  scoring: "roc_auc"
+  # BEST MODEL selection:
+  # - selection_dataset: choose best model on "validation" (recommended) to avoid test-set selection bias.
+  # - metric: which metric to use for selection.
+  # - fallback_metric: used when the primary metric is not actionable (e.g., business_score all zeros).
+  best_model_selection_dataset: "validation"  # "validation" | "test"
+  best_model_metric: "business_score"         # "business_score" | "pr_auc" | "roc_auc" | ...
+  best_model_fallback_metric: "pr_auc"
   n_trials: 100
   
   # Business constraints for imbalanced classification (threshold moving)
   # Goal: ensure Recall >= min_recall AND Precision >= min_precision
   # Business target: keep recall high (dataset positive ratio ~0.15),
   # then maximize precision under that recall constraint.
-  min_recall: 0.6
-  min_precision: 0.25
-  optimize_threshold: true  # Optimize threshold to meet recall requirement
-  # Threshold selection policy under constraints:
-  # - max_precision: maximize precision (can yield very high thresholds and unstable recall on test)
-  # - max_recall: maximize recall under precision constraint (recommended when recall is critical)
-  # If your test recall is still too low (common when test probabilities are less calibrated/lower),
-  # use the more aggressive recall-first strategy below.
-  # For "maximize precision under recall>=min_recall", use:
-  threshold_selection: "max_f1"
+  min_recall: 0.5
+  # min_precision: 0.25
+  # Threshold strategy:
+  # - fixed: use config.yaml thresholds below
+  # - validation: pick threshold on a validation set to satisfy min_recall and maximize precision
+  threshold_strategy: "validation"  # "fixed" or "validation"
+  optimize_threshold: false  # kept for backward compatibility; ignored when threshold_strategy="validation"
+  thresholds:
+    default: 0.5
+    lightgbm: 0.30
+    xgboost: 0.34
+    catboost: 0.38
+    ensemble: 0.35
   
   ensemble:
     method: "voting"  # voting or stacking
@@ -85,9 +126,26 @@ training:
   
   # Fast mode settings (used when mode="fast")
   fast:
-    n_trials: 20  # Reduced optimization trials
+    n_trials: 15  # Reduced optimization trials
     cv_folds: 3  # Fewer CV folds
     models: ["lightgbm", "xgboost", "catboost", "ensemble"]  # Fewer models to train
+    # FAST tuning settings (speed-first)
+    # - strategy: "holdout" runs ONE stratified split per Optuna trial (much faster than KFold)
+    # - budgets: cap estimators/iterations during tuning only
+    tuning:
+      strategy: "holdout"
+      holdout_size: 0.2
+      early_stopping_rounds: 30
+      lightgbm_n_estimators: 800
+      xgboost_n_estimators: 600
+      catboost_iterations: 600
+      catboost_od_wait: 30
+
+  # Validation split used for threshold selection when model.threshold_strategy="validation"
+  validation:
+    strategy: "auto"          # "auto" | "time_holdout" | "holdout"
+    holdout_size: 0.2
+    date_col: "Effective To Date"
   
   # Full mode settings (used when mode="full")
   full:
@@ -95,7 +153,7 @@ training:
     cv_folds: 5  # Standard CV folds
     models: ["lightgbm", "xgboost", "catboost", "ensemble"]  # All models
   
-  early_stopping_rounds: 100
+  early_stopping_rounds: 50
   verbose: true
   use_gpu: false
 

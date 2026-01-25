@@ -12,7 +12,22 @@ def load_config(config_path: str = "config.yaml") -> Dict[str, Any]:
     
     with open(config_file, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
-    
+
+    # Optional: resolve dataset split profile to train/test paths
+    data_cfg = config.get("data", {}) or {}
+    active = data_cfg.get("active_split")
+    splits = data_cfg.get("splits") or {}
+    if active and isinstance(splits, dict) and active in splits:
+        profile = splits.get(active) or {}
+        train_path = profile.get("train_path")
+        test_path = profile.get("test_path")
+        if train_path and test_path:
+            config.setdefault("data", {})
+            config["data"]["train_path"] = train_path
+            config["data"]["test_path"] = test_path
+            # Ensure downstream pipeline uses the resolved separate files.
+            config["data"]["use_separate_files"] = True
+
     return config
 
 

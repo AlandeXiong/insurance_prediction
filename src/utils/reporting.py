@@ -10,7 +10,8 @@ import json
 from sklearn.metrics import (
     roc_auc_score, accuracy_score, precision_score,
     recall_score, f1_score, classification_report, 
-    confusion_matrix, roc_curve, precision_recall_curve
+    confusion_matrix, roc_curve, precision_recall_curve,
+    average_precision_score
 )
 import warnings
 warnings.filterwarnings('ignore')
@@ -61,7 +62,9 @@ class ModelReportGenerator:
                                 test_results: Dict[str, Dict[str, float]],
                                 training_time: float = None,
                                 cv_metric_name: str = "cv_score",
-                                best_model_metric: str = "roc_auc") -> Dict[str, Any]:
+                                best_model_metric: str = "roc_auc",
+                                best_model_override: Optional[str] = None,
+                                best_model_selection: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Generate comprehensive training report.
         
@@ -81,6 +84,7 @@ class ModelReportGenerator:
             'models_trained': list(test_results.keys()),
             'cv_metric': cv_metric_name,
             'best_model_metric': best_model_metric,
+            'best_model_selection': convert_numpy_types(best_model_selection) if best_model_selection else None,
             'cross_validation': {},
             'test_performance': {},
             'best_model': None,
@@ -106,10 +110,35 @@ class ModelReportGenerator:
             report['test_performance'][model_name] = {
                 k: convert_numpy_types(v) for k, v in metrics.items()
             }
-            metric_value = float(metrics.get(best_model_metric, metrics.get('roc_auc', 0.0)))
-            if metric_value > best_value:
-                best_value = metric_value
-                report['best_model'] = model_name
+
+        # Best model selection
+        if best_model_override and best_model_override in report['test_performance']:
+            report['best_model'] = str(best_model_override)
+        else:
+            primary_values = {}
+            for model_name, metrics in test_results.items():
+                metric_value = float(metrics.get(best_model_metric, metrics.get('roc_auc', 0.0)))
+                primary_values[model_name] = metric_value
+                if metric_value > best_value:
+                    best_value = metric_value
+                    report['best_model'] = model_name
+
+            # Guardrail: if business_score is unusable (all zeros), fall back to PR-AUC (or ROC-AUC).
+            if str(best_model_metric).lower().strip() == "business_score":
+                max_primary = max(primary_values.values()) if primary_values else 0.0
+                if float(max_primary) <= 0.0:
+                    fallback_metric = "pr_auc" if any(
+                        "pr_auc" in (test_results.get(m, {}) or {}) for m in test_results.keys()
+                    ) else "roc_auc"
+                    fallback_best = None
+                    fallback_best_val = -1.0
+                    for model_name, metrics in test_results.items():
+                        val = float(metrics.get(fallback_metric, metrics.get("roc_auc", 0.0)))
+                        if val > fallback_best_val:
+                            fallback_best_val = val
+                            fallback_best = model_name
+                    if fallback_best is not None:
+                        report['best_model'] = fallback_best
         
         # Feature importance summary
         for model_name, importance_dict in feature_importance.items():
@@ -180,7 +209,8 @@ class ModelReportGenerator:
         ax = axes[1]
         for model_name, proba in probabilities.items():
             precision, recall, _ = precision_recall_curve(y_true, proba)
-            ax.plot(recall, precision, label=model_name, linewidth=2)
+            ap = average_precision_score(y_true, proba)
+            ax.plot(recall, precision, label=f'{model_name} (AP={ap:.4f})', linewidth=2)
         ax.set_xlabel('Recall', fontsize=12)
         ax.set_ylabel('Precision', fontsize=12)
         ax.set_title('Precision-Recall Curves', fontsize=14, fontweight='bold')
@@ -208,7 +238,7 @@ class ModelReportGenerator:
         ax = axes[3]
         # NOTE: Accuracy can be misleading on imbalanced data (positive class ~0.15).
         # We plot balanced_accuracy and business_score instead.
-        metrics_to_plot = ['roc_auc', 'balanced_accuracy', 'precision', 'recall', 'business_score']
+        metrics_to_plot = ['roc_auc', 'pr_auc', 'balanced_accuracy', 'precision', 'recall', 'business_score']
         model_names = list(predictions.keys())
         x = np.arange(len(metrics_to_plot))
         width = 0.8 / len(model_names)
@@ -357,6 +387,18 @@ class ModelReportGenerator:
             report_lines.append("\n" + "-" * 80)
             report_lines.append(f"BEST MODEL: {best_model.upper()}")
             report_lines.append("-" * 80)
+            selection = self.report_data.get('best_model_selection')
+            if selection:
+                ds = selection.get('dataset', 'N/A')
+                metric = selection.get('metric', 'N/A')
+                val = selection.get('value', None)
+                fallback = selection.get('fallback_metric', None)
+                if val is not None:
+                    report_lines.append(f"  Selected on: {ds} | metric: {metric} | value: {float(val):.4f}")
+                else:
+                    report_lines.append(f"  Selected on: {ds} | metric: {metric}")
+                if fallback:
+                    report_lines.append(f"  Fallback metric: {fallback}")
             best_metrics = self.report_data['test_performance'][best_model]
             for metric_name, value in best_metrics.items():
                 report_lines.append(f"  {metric_name.capitalize()}: {value:.4f}")

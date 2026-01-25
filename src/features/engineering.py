@@ -18,9 +18,13 @@ class FeatureEngineer:
     - We use leakage-safe alternatives (count/frequency + group aggregations on numeric features).
     """
     
-    def __init__(self, categorical_features: List[str], 
-                 numerical_features: List[str],
-                 target_column: str = "Response"):
+    def __init__(
+        self,
+        categorical_features: List[str],
+        numerical_features: List[str],
+        target_column: str = "Response",
+        drop_effective_to_date_original: bool = True,
+    ):
         """
         Initialize feature engineer.
         
@@ -32,6 +36,7 @@ class FeatureEngineer:
         self.categorical_features = categorical_features
         self.numerical_features = numerical_features
         self.target_column = target_column
+        self.drop_effective_to_date_original = bool(drop_effective_to_date_original)
         
         # Encoders and transformers
         self.label_encoders = {}
@@ -58,13 +63,21 @@ class FeatureEngineer:
         # Date feature reference (optional)
         self.effective_date_ref_ = None
         
-    def create_interaction_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        # Interaction feature artifacts (learned on train only)
+        # Used to generate leakage-safe categorical cross features consistently for fit=False.
+        self.interaction_pairs_ = []            # List[Tuple[str, str]]
+        self.interaction_count_maps_ = {}       # Dict[str, Dict[str, int]] where key is "A__B"
+        self.interaction_max_pairs_ = 10        # limit to keep feature space manageable
+        self.interaction_max_cardinality_ = 50  # only cross low-cardinality categoricals
+        
+    def create_interaction_features(self, df: pd.DataFrame, fit: bool = True) -> pd.DataFrame:
         """
         Create interaction and derived features.
         Following Kaggle best practices for feature engineering.
         
         Args:
             df: Input dataframe
+            fit: Whether to fit interaction mappings (train) or reuse existing (inference)
         
         Returns:
             Dataframe with new interaction features
@@ -132,6 +145,69 @@ class FeatureEngineer:
             df['Effective_To_Date_Day'] = dt.dt.day.fillna(0).astype(int)
             df['Effective_To_Date_Weekday'] = dt.dt.weekday.fillna(0).astype(int)
             df['Effective_To_Date_Quarter'] = dt.dt.quarter.fillna(0).astype(int)
+        
+        # Leakage-safe categorical cross features (count/freq) learned on training data only.
+        # This is a common Kaggle trick and does not use target information.
+        # We only cross low-cardinality categoricals and cap the number of pairs.
+        denom = int(getattr(self, "train_size_", 0) or 0)
+        if fit:
+            # If train_size_ not set yet (e.g., stats encoding disabled), set it here.
+            if denom <= 0:
+                self.train_size_ = int(len(df))
+                denom = max(int(self.train_size_), 1)
+        else:
+            # Backward compatibility / safety fallback
+            if denom <= 0:
+                denom = max(int(len(df)), 1)
+
+        # Choose interaction pairs on fit (stable across transforms)
+        if fit:
+            available_cats = [c for c in self.categorical_features if c in df.columns]
+            # Filter to low-cardinality columns to avoid explosion
+            low_card_cats = []
+            for c in available_cats:
+                try:
+                    nunique = int(df[c].nunique(dropna=False))
+                except Exception:
+                    nunique = 0
+                if 2 <= nunique <= int(getattr(self, "interaction_max_cardinality_", 50)):
+                    low_card_cats.append((c, nunique))
+
+            # Prefer lowest-cardinality pairs first (more stable, fewer sparse combos)
+            low_card_cats.sort(key=lambda x: x[1])
+            cat_names = [c for c, _ in low_card_cats]
+
+            pairs = []
+            for i in range(len(cat_names)):
+                for j in range(i + 1, len(cat_names)):
+                    pairs.append((cat_names[i], cat_names[j]))
+                    if len(pairs) >= int(getattr(self, "interaction_max_pairs_", 10)):
+                        break
+                if len(pairs) >= int(getattr(self, "interaction_max_pairs_", 10)):
+                    break
+
+            self.interaction_pairs_ = pairs
+            self.interaction_count_maps_ = {}
+
+            for a, b in self.interaction_pairs_:
+                pair_key = f"{a}__{b}"
+                combo = df[a].astype(str) + "||" + df[b].astype(str)
+                self.interaction_count_maps_[pair_key] = combo.value_counts().to_dict()
+
+        # Apply stored interaction mappings (fit or inference)
+        if getattr(self, "interaction_pairs_", None) and getattr(self, "interaction_count_maps_", None):
+            for a, b in self.interaction_pairs_:
+                pair_key = f"{a}__{b}"
+                if pair_key not in self.interaction_count_maps_:
+                    continue
+                if a not in df.columns or b not in df.columns:
+                    continue
+
+                combo = df[a].astype(str) + "||" + df[b].astype(str)
+                counts = combo.map(self.interaction_count_maps_[pair_key]).fillna(0).astype(float)
+                df[f"{pair_key}_Count"] = counts
+                df[f"{pair_key}_Freq"] = counts / float(denom)
+                df[f"{pair_key}_Count_Log"] = np.log1p(counts)
         
         return df
     
@@ -378,10 +454,14 @@ class FeatureEngineer:
         df = self.handle_missing_values(df, fit=fit)
         
         # Step 2: Create interaction features
-        df = self.create_interaction_features(df)
+        df = self.create_interaction_features(df, fit=fit)
+
+        # Optional: keep time info but drop raw date string column
+        if self.drop_effective_to_date_original and 'Effective To Date' in df.columns:
+            df = df.drop(columns=['Effective To Date'])
         
         # Step 3: Create statistical features (target encoding DISABLED by default)
-        df = self.create_statistical_features(df, y=y, fit=fit)
+        # df = self.create_statistical_features(df, y=y, fit=fit)
         
         # Step 4: Encode categorical features
         df = self.encode_categorical(df, fit=fit)
@@ -434,6 +514,13 @@ class FeatureEngineer:
             'categorical_fill_values': getattr(self, 'categorical_fill_values_', {}),
             'global_num_medians': getattr(self, 'global_num_medians_', {}),
             'global_num_means': getattr(self, 'global_num_means_', {}),
+            # Interaction feature artifacts
+            'interaction_pairs': getattr(self, 'interaction_pairs_', []) or [],
+            'interaction_count_maps': getattr(self, 'interaction_count_maps_', {}) or {},
+            'interaction_max_pairs': getattr(self, 'interaction_max_pairs_', 10),
+            'interaction_max_cardinality': getattr(self, 'interaction_max_cardinality_', 50),
+            # Date feature handling
+            'drop_effective_to_date_original': getattr(self, 'drop_effective_to_date_original', True),
             'feature_order': getattr(self, 'feature_order', None)
         }
         joblib.dump(save_data, path)
@@ -471,5 +558,11 @@ class FeatureEngineer:
         engineer.categorical_fill_values_ = data.get('categorical_fill_values', {}) or {}
         engineer.global_num_medians_ = data.get('global_num_medians', {}) or {}
         engineer.global_num_means_ = data.get('global_num_means', {}) or {}
+        # Interaction feature artifacts (backward-compatible defaults)
+        engineer.interaction_pairs_ = data.get('interaction_pairs', []) or []
+        engineer.interaction_count_maps_ = data.get('interaction_count_maps', {}) or {}
+        engineer.interaction_max_pairs_ = int(data.get('interaction_max_pairs', 10) or 10)
+        engineer.interaction_max_cardinality_ = int(data.get('interaction_max_cardinality', 50) or 50)
+        engineer.drop_effective_to_date_original = bool(data.get('drop_effective_to_date_original', True))
         print(f"Feature engineer loaded from {path}")
         return engineer
