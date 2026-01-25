@@ -185,6 +185,95 @@ class ModelTrainer:
         print(f"Best CV precision@recall>={self.min_recall}: {study.best_value:.4f}")
         return best_params
 
+    def optimize_lightgbm_raw(
+        self,
+        X_raw: pd.DataFrame,
+        y: pd.Series,
+        feature_engineer_kwargs: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Leakage-aware hyperparameter optimization for LightGBM using RAW features.
+
+        - Feature engineering is fit per fold (no extra holdout split).
+        - Objective score is precision subject to recall >= min_recall.
+        - This avoids over-optimistic scores caused by fitting preprocessing on the full dataset.
+        """
+        if lgb is None:  # pragma: no cover
+            raise ImportError(
+                "lightgbm is not installed. Install it (e.g., `pip install lightgbm`) "
+                "or remove 'lightgbm' from config.yaml model lists."
+            )
+        from src.features.engineering import FeatureEngineer
+
+        print("\nOptimizing LightGBM (raw + per-fold feature engineering)...")
+
+        class_weights = self.compute_class_weights(y)
+        base_spw = class_weights.get(1, 1.0) / class_weights.get(0, 1.0) if 0 in class_weights and 1 in class_weights else 1.0
+
+        def objective(trial):
+            params = {
+                "objective": "binary",
+                "metric": "auc",
+                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2),
+                "num_leaves": trial.suggest_int("num_leaves", 16, 256, log=True),
+                "max_depth": trial.suggest_int("max_depth", 3, 12),
+                "min_child_samples": trial.suggest_int("min_child_samples", 10, 200),
+                "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
+                "reg_alpha": trial.suggest_float("reg_alpha", 1e-9, 10.0, log=True),
+                "reg_lambda": trial.suggest_float("reg_lambda", 1e-9, 10.0, log=True),
+                "scale_pos_weight": trial.suggest_float("scale_pos_weight", 0.5, base_spw * 2),
+                "random_state": self.random_state,
+                "n_jobs": -1,
+                "verbosity": -1,
+            }
+
+            cv = StratifiedKFold(n_splits=self.cv_folds, shuffle=True, random_state=self.random_state)
+            fold_scores: List[float] = []
+            for tr_idx, va_idx in cv.split(X_raw, y):
+                X_tr_raw, X_val_raw = X_raw.iloc[tr_idx], X_raw.iloc[va_idx]
+                y_tr, y_val = y.iloc[tr_idx], y.iloc[va_idx]
+
+                fe = FeatureEngineer(**feature_engineer_kwargs)
+                X_tr = fe.transform(X_tr_raw, y=y_tr, fit=True)
+                X_val = fe.transform(X_val_raw, fit=False)
+
+                model = lgb.LGBMClassifier(**params, n_estimators=5000)
+                model.fit(
+                    X_tr,
+                    y_tr,
+                    eval_set=[(X_val, y_val)],
+                    callbacks=[lgb.early_stopping(stopping_rounds=100, verbose=False)],
+                )
+                proba = model.predict_proba(X_val)[:, 1]
+                _, metrics = self.find_optimal_threshold(
+                    y_val.values,
+                    proba,
+                    min_recall=self.min_recall,
+                    min_precision=self.min_precision,
+                )
+                score = float(metrics["precision"]) if float(metrics["recall"]) >= float(self.min_recall) else 0.0
+                fold_scores.append(score)
+
+            return float(np.mean(fold_scores))
+
+        study = optuna.create_study(direction="maximize", study_name="lightgbm_opt_raw")
+        study.optimize(objective, n_trials=self.n_trials, show_progress_bar=True)
+
+        best_params = dict(study.best_params)
+        best_params.update(
+            {
+                "objective": "binary",
+                "metric": "auc",
+                "random_state": self.random_state,
+                "n_jobs": -1,
+                "verbosity": -1,
+            }
+        )
+        print(f"Best LightGBM params (raw-CV): {best_params}")
+        print(f"Best CV precision@recall>={self.min_recall}: {study.best_value:.4f}")
+        return best_params
+
     def train_lightgbm(
         self,
         X_train: pd.DataFrame,
@@ -401,10 +490,12 @@ class ModelTrainer:
 
             oof_proba = np.zeros(len(y), dtype=float)
             fold_artifacts: List[Dict[str, Any]] = []
+            fold_thresholds: List[float] = []
 
             for train_idx, val_idx in cv.split(X_raw, y):
                 X_tr_raw, X_val_raw = X_raw.iloc[train_idx], X_raw.iloc[val_idx]
                 y_tr = y.iloc[train_idx]
+                y_val = y.iloc[val_idx]
 
                 # Fit feature engineering on the training fold only
                 fe = FeatureEngineer(**feature_engineer_kwargs)
@@ -424,7 +515,8 @@ class ModelTrainer:
                     params.setdefault("verbosity", 0)
                     model = xgb.XGBClassifier(**params, n_estimators=1000)
                     model.fit(X_tr, y_tr)
-                    oof_proba[val_idx] = model.predict_proba(X_val)[:, 1]
+                    proba_val = model.predict_proba(X_val)[:, 1]
+                    oof_proba[val_idx] = proba_val
                     fold_artifacts.append({"fe": fe, "model": model})
 
                 elif name == "lightgbm":
@@ -442,10 +534,11 @@ class ModelTrainer:
                     model.fit(
                         X_tr,
                         y_tr,
-                        eval_set=[(X_val, y.iloc[val_idx])],
+                        eval_set=[(X_val, y_val)],
                         callbacks=[lgb.early_stopping(stopping_rounds=100, verbose=False)],
                     )
-                    oof_proba[val_idx] = model.predict_proba(X_val)[:, 1]
+                    proba_val = model.predict_proba(X_val)[:, 1]
+                    oof_proba[val_idx] = proba_val
                     fold_artifacts.append({"fe": fe, "model": model})
 
                 elif name == "catboost":
@@ -457,7 +550,8 @@ class ModelTrainer:
                     model = CatBoostClassifier(**params)
                     cat_features = self._cat_feature_indices(X_tr, cat_feature_names)
                     model.fit(X_tr, y_tr, cat_features=cat_features, verbose=False)
-                    oof_proba[val_idx] = model.predict_proba(X_val)[:, 1]
+                    proba_val = model.predict_proba(X_val)[:, 1]
+                    oof_proba[val_idx] = proba_val
                     fold_artifacts.append({"fe": fe, "model": model})
 
                 elif name == "ensemble":
@@ -483,7 +577,7 @@ class ModelTrainer:
                         m_lgb.fit(
                             X_tr,
                             y_tr,
-                            eval_set=[(X_val, y.iloc[val_idx])],
+                            eval_set=[(X_val, y_val)],
                             callbacks=[lgb.early_stopping(stopping_rounds=100, verbose=False)],
                         )
                         fold_probas.append(m_lgb.predict_proba(X_val)[:, 1])
@@ -514,19 +608,45 @@ class ModelTrainer:
                         fold_probas.append(m_cat.predict_proba(X_val)[:, 1])
                         models_dict["cat"] = m_cat
 
-                    oof_proba[val_idx] = np.mean(np.vstack(fold_probas), axis=0)
+                    proba_val = np.mean(np.vstack(fold_probas), axis=0)
+                    oof_proba[val_idx] = proba_val
                     fold_artifacts.append({"fe": fe, "models": models_dict})
 
                 else:
                     # Unsupported model name for raw OOF thresholding
                     continue
 
-            threshold, metrics = self.find_optimal_threshold(
-                y.values,
-                oof_proba,
-                min_recall=self.min_recall,
-                min_precision=self.min_precision,
-            )
+                # Robust thresholding: compute a per-fold threshold on the fold's validation split,
+                # then aggregate (median) across folds. This is typically more stable than picking
+                # a single "global" threshold on concatenated OOF predictions (which can overfit).
+                t_fold, _ = self.find_optimal_threshold(
+                    y_val.values,
+                    proba_val,
+                    min_recall=self.min_recall,
+                    min_precision=self.min_precision,
+                )
+                fold_thresholds.append(float(t_fold))
+
+            # Final threshold: median of per-fold thresholds (robust to fold-to-fold variance)
+            if fold_thresholds:
+                threshold = float(np.median(np.array(fold_thresholds, dtype=float)))
+            else:
+                threshold, _ = self.find_optimal_threshold(
+                    y.values,
+                    oof_proba,
+                    min_recall=self.min_recall,
+                    min_precision=self.min_precision,
+                )
+
+            # Report metrics on full OOF predictions using the aggregated threshold
+            y_pred_oof = (oof_proba >= threshold).astype(int)
+            metrics = {
+                "threshold": float(threshold),
+                "precision": float(precision_score(y.values, y_pred_oof, zero_division=0)),
+                "recall": float(recall_score(y.values, y_pred_oof)),
+                "f1": float(f1_score(y.values, y_pred_oof)),
+                "f2": float(fbeta_score(y.values, y_pred_oof, beta=2)),
+            }
             self.best_thresholds[name] = float(threshold)
             results[name] = {k: float(v) for k, v in metrics.items()}
             self.oof_baggers_raw[name] = fold_artifacts
@@ -713,6 +833,7 @@ class ModelTrainer:
         - then apply a selection policy:
             * max_precision (default): maximize precision (can produce very high thresholds)
             * max_recall: maximize recall (more conservative / recall-first)
+            * max_f1: maximize F1 score (within constraints)
 
         Notes on sklearn's `precision_recall_curve` output:
         - precision/recall arrays have length = len(thresholds) + 1
@@ -753,6 +874,18 @@ class ModelTrainer:
                 # pick the LOWEST feasible threshold (typically yields the highest/most stable recall on unseen data)
                 # while still satisfying both constraints.
                 best_idx = feasible[int(np.argmin(candidates_t[feasible]))]
+            elif self.threshold_selection == "max_f1":
+                # Maximize F1 under constraints; tie-break by higher precision, then lower threshold.
+                f1 = (2.0 * candidates_p * candidates_r) / (candidates_p + candidates_r + 1e-12)
+                best_f1 = np.max(f1[feasible])
+                best_pool = feasible[np.where(np.isclose(f1[feasible], best_f1, rtol=0, atol=1e-12))[0]]
+                if best_pool.size > 1:
+                    # Higher precision wins; if still tied, prefer lower threshold for robustness.
+                    best_p = np.max(candidates_p[best_pool])
+                    best_pool = best_pool[np.where(np.isclose(candidates_p[best_pool], best_p, rtol=0, atol=1e-12))[0]]
+                    best_idx = int(best_pool[np.argmin(candidates_t[best_pool])])
+                else:
+                    best_idx = int(best_pool[0])
             else:
                 # Max precision, tie-break by higher recall (precision-first)
                 best_idx = feasible[np.lexsort((candidates_r[feasible], candidates_p[feasible]))][-1]
@@ -766,12 +899,20 @@ class ModelTrainer:
                 if self.threshold_selection == "max_recall":
                     # Lowest threshold among those that meet recall (maximize recall stability)
                     best_idx = feasible_recall[int(np.argmin(candidates_t[feasible_recall]))]
+                elif self.threshold_selection == "max_f1":
+                    # If we can't meet both constraints, maximize F1 among points meeting recall.
+                    f1 = (2.0 * candidates_p * candidates_r) / (candidates_p + candidates_r + 1e-12)
+                    best_idx = int(feasible_recall[np.argmax(f1[feasible_recall])])
                 else:
                     best_idx = feasible_recall[np.argmax(candidates_p[feasible_recall])]
             elif feasible_precision.size > 0:
                 # Max recall under precision constraint
                 if self.threshold_selection == "max_recall":
                     best_idx = feasible_precision[int(np.argmin(candidates_t[feasible_precision]))]
+                elif self.threshold_selection == "max_f1":
+                    # Maximize F1 among points meeting precision.
+                    f1 = (2.0 * candidates_p * candidates_r) / (candidates_p + candidates_r + 1e-12)
+                    best_idx = int(feasible_precision[np.argmax(f1[feasible_precision])])
                 else:
                     best_idx = feasible_precision[np.argmax(candidates_r[feasible_precision])]
             else:
@@ -867,6 +1008,88 @@ class ModelTrainer:
         print(f"Best CV precision@recall>={self.min_recall}: {study.best_value:.4f}")
         
         return best_params
+
+    def optimize_xgboost_raw(
+        self,
+        X_raw: pd.DataFrame,
+        y: pd.Series,
+        feature_engineer_kwargs: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Leakage-aware hyperparameter optimization for XGBoost using RAW features.
+
+        - Feature engineering is fit per fold (no extra holdout split).
+        - Objective score is precision subject to recall >= min_recall.
+        """
+        from src.features.engineering import FeatureEngineer
+
+        print("\nOptimizing XGBoost (raw + per-fold feature engineering)...")
+
+        class_weights = self.compute_class_weights(y)
+        base_spw = class_weights.get(1, 1.0) / class_weights.get(0, 1.0) if 0 in class_weights and 1 in class_weights else 1.0
+
+        def objective(trial):
+            params = {
+                "objective": "binary:logistic",
+                "eval_metric": "auc",
+                "max_depth": trial.suggest_int("max_depth", 3, 10),
+                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3),
+                "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
+                "min_child_weight": trial.suggest_int("min_child_weight", 1, 10),
+                "gamma": trial.suggest_float("gamma", 0, 5),
+                "reg_alpha": trial.suggest_float("reg_alpha", 1e-9, 10.0, log=True),
+                "reg_lambda": trial.suggest_float("reg_lambda", 1e-9, 10.0, log=True),
+                "scale_pos_weight": trial.suggest_float("scale_pos_weight", 0.5, base_spw * 2),
+                "random_state": self.random_state,
+                "verbosity": 0,
+            }
+
+            cv = StratifiedKFold(n_splits=self.cv_folds, shuffle=True, random_state=self.random_state)
+            fold_scores: List[float] = []
+            for tr_idx, va_idx in cv.split(X_raw, y):
+                X_tr_raw, X_val_raw = X_raw.iloc[tr_idx], X_raw.iloc[va_idx]
+                y_tr, y_val = y.iloc[tr_idx], y.iloc[va_idx]
+
+                fe = FeatureEngineer(**feature_engineer_kwargs)
+                X_tr = fe.transform(X_tr_raw, y=y_tr, fit=True)
+                X_val = fe.transform(X_val_raw, fit=False)
+
+                model = xgb.XGBClassifier(**params, n_estimators=1000)
+                model.fit(
+                    X_tr,
+                    y_tr,
+                    eval_set=[(X_val, y_val)],
+                    early_stopping_rounds=100,
+                    verbose=False,
+                )
+                proba = model.predict_proba(X_val)[:, 1]
+                _, metrics = self.find_optimal_threshold(
+                    y_val.values,
+                    proba,
+                    min_recall=self.min_recall,
+                    min_precision=self.min_precision,
+                )
+                score = float(metrics["precision"]) if float(metrics["recall"]) >= float(self.min_recall) else 0.0
+                fold_scores.append(score)
+
+            return float(np.mean(fold_scores))
+
+        study = optuna.create_study(direction="maximize", study_name="xgboost_opt_raw")
+        study.optimize(objective, n_trials=self.n_trials, show_progress_bar=True)
+
+        best_params = dict(study.best_params)
+        best_params.update(
+            {
+                "objective": "binary:logistic",
+                "eval_metric": "auc",
+                "random_state": self.random_state,
+                "verbosity": 0,
+            }
+        )
+        print(f"Best XGBoost params (raw-CV): {best_params}")
+        print(f"Best CV precision@recall>={self.min_recall}: {study.best_value:.4f}")
+        return best_params
     
     def optimize_catboost(self, X_train: pd.DataFrame, y_train: pd.Series,
                           cat_feature_names: Optional[List[str]] = None) -> Dict[str, Any]:
@@ -942,6 +1165,96 @@ class ModelTrainer:
         print(f"Best CatBoost params: {best_params}")
         print(f"Best CV precision@recall>={self.min_recall}: {study.best_value:.4f}")
         
+        return best_params
+
+    def optimize_catboost_raw(
+        self,
+        X_raw: pd.DataFrame,
+        y: pd.Series,
+        feature_engineer_kwargs: Dict[str, Any],
+        cat_feature_names: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Leakage-aware hyperparameter optimization for CatBoost using RAW features.
+
+        - Feature engineering is fit per fold (no extra holdout split).
+        - Objective score is precision subject to recall >= min_recall.
+        """
+        if CatBoostClassifier is None:  # pragma: no cover
+            raise ImportError("catboost is not installed. Install it (e.g., `pip install catboost`).")
+        from src.features.engineering import FeatureEngineer
+
+        print("\nOptimizing CatBoost (raw + per-fold feature engineering)...")
+
+        class_weights = self.compute_class_weights(y)
+        class_weights_list = [class_weights.get(0, 1.0), class_weights.get(1, 1.0)]
+
+        def objective(trial):
+            params = {
+                "iterations": 1000,
+                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3),
+                "depth": trial.suggest_int("depth", 4, 10),
+                "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1, 10),
+                "bootstrap_type": trial.suggest_categorical("bootstrap_type", ["Bayesian", "Bernoulli", "MVS"]),
+                "class_weights": class_weights_list,
+                "random_seed": self.random_state,
+                "od_type": "Iter",
+                "od_wait": 100,
+                "verbose": False,
+            }
+
+            if params["bootstrap_type"] == "Bayesian":
+                params["bagging_temperature"] = trial.suggest_float("bagging_temperature", 0, 1)
+            elif params["bootstrap_type"] == "Bernoulli":
+                params["subsample"] = trial.suggest_float("subsample", 0.6, 1.0)
+
+            cv = StratifiedKFold(n_splits=self.cv_folds, shuffle=True, random_state=self.random_state)
+            fold_scores: List[float] = []
+            for tr_idx, va_idx in cv.split(X_raw, y):
+                X_tr_raw, X_val_raw = X_raw.iloc[tr_idx], X_raw.iloc[va_idx]
+                y_tr, y_val = y.iloc[tr_idx], y.iloc[va_idx]
+
+                fe = FeatureEngineer(**feature_engineer_kwargs)
+                X_tr = fe.transform(X_tr_raw, y=y_tr, fit=True)
+                X_val = fe.transform(X_val_raw, fit=False)
+
+                # Use fold-specific class weights (more stable under small data)
+                cw_fold = self.compute_class_weights(y_tr)
+                params_fold = dict(params)
+                params_fold["class_weights"] = [cw_fold.get(0, 1.0), cw_fold.get(1, 1.0)]
+
+                model = CatBoostClassifier(**params_fold)
+                cat_features_idx = self._cat_feature_indices(X_tr, cat_feature_names)
+                model.fit(X_tr, y_tr, eval_set=(X_val, y_val), cat_features=cat_features_idx, verbose=False)
+
+                proba = model.predict_proba(X_val)[:, 1]
+                _, metrics = self.find_optimal_threshold(
+                    y_val.values,
+                    proba,
+                    min_recall=self.min_recall,
+                    min_precision=self.min_precision,
+                )
+                score = float(metrics["precision"]) if float(metrics["recall"]) >= float(self.min_recall) else 0.0
+                fold_scores.append(score)
+
+            return float(np.mean(fold_scores))
+
+        study = optuna.create_study(direction="maximize", study_name="catboost_opt_raw")
+        study.optimize(objective, n_trials=self.n_trials, show_progress_bar=True)
+
+        best_params = dict(study.best_params)
+        best_params.update(
+            {
+                "iterations": 1000,
+                "class_weights": class_weights_list,
+                "random_seed": self.random_state,
+                "od_type": "Iter",
+                "od_wait": 100,
+                "verbose": False,
+            }
+        )
+        print(f"Best CatBoost params (raw-CV): {best_params}")
+        print(f"Best CV precision@recall>={self.min_recall}: {study.best_value:.4f}")
         return best_params
     
     def train_xgboost(self, X_train: pd.DataFrame, y_train: pd.Series,

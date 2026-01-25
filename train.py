@@ -5,7 +5,14 @@ from pathlib import Path
 import time
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import roc_auc_score, accuracy_score, precision_score, recall_score, f1_score
+from sklearn.metrics import (
+    roc_auc_score,
+    accuracy_score,
+    balanced_accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+)
 
 from src.utils.config import load_config, get_paths
 from src.utils.logger import setup_logger
@@ -141,47 +148,24 @@ def main():
 
 
     # NOTE ABOUT FEATURE ENGINEERING (IMPORTANT)
-    # This training pipeline intentionally uses feature engineering in two different "fit scopes":
+    # This training pipeline uses feature engineering in two "fit scopes":
     #
-    # 1) TUNING scope (train-fit/val-fit):
-    #    - We split RAW data into train-fit and val-fit first.
-    #    - We fit FeatureEngineer on train-fit ONLY, then transform both train-fit and val-fit.
-    #    - This prevents leakage of statistics (scaler/encoders/group aggregates) into val-fit.
-    #    - Hyperparameter tuning and early stopping are done using these processed matrices.
+    # 1) TUNING / MODEL SELECTION scope (CV/OOF on RAW):
+    #    - We DO NOT create an extra fixed holdout split (to avoid wasting data on small datasets).
+    #    - During hyperparameter tuning (Optuna) and threshold fitting (OOF),
+    #      feature engineering is fit per fold on RAW data to prevent leakage.
     #
-    # 2) FINAL/INFERENCE scope (full train / test):
-    #    - We fit a new FeatureEngineer on the FULL training set, then transform train and test.
+    # 2) FINAL / INFERENCE scope (full train / test):
+    #    - We fit a FeatureEngineer on the FULL training set, then transform train and test.
     #    - We save this FeatureEngineer to disk for API/inference to guarantee consistent preprocessing.
-    #
-    # We keep these two scopes separate on purpose: it is best practice for robust evaluation.
     feature_engineer_kwargs = {
         "categorical_features": categorical_features,
         "numerical_features": numerical_features,
         "target_column": target_column,
     }
 
-    # Split BEFORE feature engineering (prevents leakage into validation metrics/thresholds)
-    from sklearn.model_selection import train_test_split as tts
-    X_train_fit_raw, X_val_fit_raw, y_train_fit, y_val_fit = tts(
-        X_train, y_train,
-        test_size=0.2,
-        random_state=config['data']['random_state'],
-        stratify=y_train
-    )
-    logger.info(f"Training set for model fitting (raw): {X_train_fit_raw.shape}")
-    logger.info(f"Validation set for threshold optimization (raw): {X_val_fit_raw.shape}")
-
-    # 4.3 Fit feature engineering
-    # Fit feature engineering on TRAIN-FIT only, transform TRAIN-FIT and VAL-FIT
-    feature_engineer_tune = FeatureEngineer(**feature_engineer_kwargs)
-    X_train_fit = feature_engineer_tune.transform(X_train_fit_raw, y=y_train_fit, fit=True)
-    X_val_fit = feature_engineer_tune.transform(X_val_fit_raw, fit=False)
-    logger.info(f"Training set for model fitting (processed): {X_train_fit.shape}")
-    logger.info(f"Validation set for threshold optimization (processed): {X_val_fit.shape}")
-
-    # From this point, ALL models in the tuning stage use the SAME processed matrices
-    # (X_train_fit / X_val_fit). This is the unified feature pipeline across models.
-    # Model training (after feature engineering is prepared)
+    # Model training (tuning / selection) is performed via CV/OOF on RAW data
+    # (feature engineering fit per fold inside trainer routines).
     logger.info("Starting model training and optimization...")
 
     # Determine training mode (fast or full)
@@ -238,30 +222,30 @@ def main():
     # All models will be trained with class weights and threshold optimization
 
 
-    # 5.1 First Round Training
-
+    # 5.1 Hyperparameter optimization (no extra holdout split; CV + per-fold feature engineering on RAW)
     if 'xgboost' in models_to_train:
-        logger.info("Training XGBoost...")
-        trainer.train_xgboost(X_train_fit, y_train_fit, X_val_fit, y_val_fit, optimize=True)
-
-    if 'lightgbm' in models_to_train:
-        logger.info("Training LightGBM...")
-        trainer.train_lightgbm(X_train_fit, y_train_fit, X_val_fit, y_val_fit, optimize=True)
-
-    if 'catboost' in models_to_train:
-        logger.info("Training CatBoost...")
-        trainer.train_catboost(
-            X_train_fit, y_train_fit, X_val_fit, y_val_fit,
-            optimize=True,
-            cat_feature_names=categorical_features
+        logger.info("Optimizing XGBoost (CV on raw + per-fold feature engineering)...")
+        trainer.best_params['xgboost'] = trainer.optimize_xgboost_raw(
+            X_train,
+            y_train,
+            feature_engineer_kwargs=feature_engineer_kwargs,
         )
 
-    if 'ensemble' in models_to_train:
-        logger.info("Training Ensemble model...")
-        trainer.train_ensemble(
-            X_train_fit, y_train_fit, X_val_fit, y_val_fit,
-            method=config['model']['ensemble']['method'],
-            base_models=[m for m in models_to_train if m != "ensemble"]
+    if 'lightgbm' in models_to_train:
+        logger.info("Optimizing LightGBM (CV on raw + per-fold feature engineering)...")
+        trainer.best_params['lightgbm'] = trainer.optimize_lightgbm_raw(
+            X_train,
+            y_train,
+            feature_engineer_kwargs=feature_engineer_kwargs,
+        )
+
+    if 'catboost' in models_to_train:
+        logger.info("Optimizing CatBoost (CV on raw + per-fold feature engineering)...")
+        trainer.best_params['catboost'] = trainer.optimize_catboost_raw(
+            X_train,
+            y_train,
+            feature_engineer_kwargs=feature_engineer_kwargs,
+            cat_feature_names=categorical_features,
         )
 
     # 5.2 Fit FINAL feature engineering on FULL TRAIN and transform TRAIN/TEST for final training/inference
@@ -349,15 +333,24 @@ def main():
         threshold = trainer.best_thresholds.get(model_name, 0.5)
         y_pred = (proba >= threshold).astype(int)
         y_pred_default = (proba >= 0.5).astype(int)
+        # Business score: precision under the recall constraint (recall >= min_recall).
+        # This avoids selecting models that look good on ROC-AUC but fail the business operating point.
+        precision_at_constraint = precision_score(y_test, y_pred, zero_division=0)
+        recall_at_constraint = recall_score(y_test, y_pred)
+        business_score = float(precision_at_constraint) if float(recall_at_constraint) >= float(min_recall) else 0.0
 
         test_results[model_name] = {
             "roc_auc": roc_auc_score(y_test, proba),
             "accuracy": accuracy_score(y_test, y_pred),
+            # Balanced accuracy is more informative than accuracy on imbalanced data.
+            "balanced_accuracy": balanced_accuracy_score(y_test, y_pred),
             "precision": precision_score(y_test, y_pred, zero_division=0),
             "recall": recall_score(y_test, y_pred),
             "f1": f1_score(y_test, y_pred),
+            "business_score": business_score,
             "threshold": float(threshold),
             "accuracy_default": accuracy_score(y_test, y_pred_default),
+            "balanced_accuracy_default": balanced_accuracy_score(y_test, y_pred_default),
             "precision_default": precision_score(y_test, y_pred_default, zero_division=0),
             "recall_default": recall_score(y_test, y_pred_default),
             "f1_default": f1_score(y_test, y_pred_default),
@@ -382,7 +375,7 @@ def main():
         test_results=test_results,
         training_time=training_time,
         cv_metric_name=f"Precision@Recall>={min_recall}",
-        best_model_metric="roc_auc"
+        best_model_metric="business_score"
     )
 
     # Generate visualizations

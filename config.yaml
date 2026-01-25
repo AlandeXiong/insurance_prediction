@@ -71,7 +71,7 @@ model:
   # If your test recall is still too low (common when test probabilities are less calibrated/lower),
   # use the more aggressive recall-first strategy below.
   # For "maximize precision under recall>=min_recall", use:
-  threshold_selection: "max_precision"
+  threshold_selection: "max_f1"
   
   ensemble:
     method: "voting"  # voting or stacking

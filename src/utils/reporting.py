@@ -8,7 +8,7 @@ from typing import Dict, List, Any, Optional
 from datetime import datetime
 import json
 from sklearn.metrics import (
-    roc_auc_score, accuracy_score, precision_score, 
+    roc_auc_score, accuracy_score, precision_score,
     recall_score, f1_score, classification_report, 
     confusion_matrix, roc_curve, precision_recall_curve
 )
@@ -189,8 +189,12 @@ class ModelReportGenerator:
         
         # 3. Confusion Matrices (for best model)
         if predictions:
-            best_model = max(probabilities.keys(), 
-                           key=lambda x: roc_auc_score(y_true, probabilities[x]))
+            # Prefer the report-selected best model (business objective) if available.
+            # Fall back to ROC-AUC if report data hasn't been generated.
+            best_model = self.report_data.get('best_model')
+            if not best_model:
+                best_model = max(probabilities.keys(),
+                                 key=lambda x: roc_auc_score(y_true, probabilities[x]))
             ax = axes[2]
             cm = confusion_matrix(y_true, predictions[best_model])
             sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax,
@@ -202,7 +206,9 @@ class ModelReportGenerator:
         
         # 4. Model Comparison Bar Chart
         ax = axes[3]
-        metrics_to_plot = ['roc_auc', 'accuracy', 'precision', 'recall', 'f1']
+        # NOTE: Accuracy can be misleading on imbalanced data (positive class ~0.15).
+        # We plot balanced_accuracy and business_score instead.
+        metrics_to_plot = ['roc_auc', 'balanced_accuracy', 'precision', 'recall', 'business_score']
         model_names = list(predictions.keys())
         x = np.arange(len(metrics_to_plot))
         width = 0.8 / len(model_names)
