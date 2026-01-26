@@ -2,7 +2,6 @@
 import pandas as pd
 import numpy as np
 from pathlib import Path
-import yaml
 import sys
 
 def check_all_leakage_sources():
@@ -11,21 +10,21 @@ def check_all_leakage_sources():
     print("COMPREHENSIVE DATA LEAKAGE DIAGNOSTIC")
     print("="*80)
     
-    # Load config
-    config_path = Path("../../config.yaml")
-    if not config_path.exists():
-        print("Error: config.yaml not found")
-        return
-    
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
-    
-    # Load data
-    data_path = config['data']['train_path']
+    # Resolve repo root and import project modules
+    root = Path(__file__).resolve().parents[2]
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    from src.utils.config import load_config
+    from src.utils.data_loading import load_train_test_data
+
+    config = load_config(str(root / "config.yaml"))
+
+    # Load training data only (avoid peeking at test)
+    df_train, _, resolved_split = load_train_test_data(config)
     target_col = config['data']['target_column']
-    
-    print(f"\n1. Loading data from: {data_path}")
-    df = pd.read_csv(data_path)
+
+    print(f"\n1. Loading training data (split={resolved_split.strategy}, details={resolved_split.details})")
+    df = df_train.copy()
     print(f"   Data shape: {df.shape}")
     print(f"   Target column: {target_col}")
     print(f"   Target distribution:\n{df[target_col].value_counts()}")
@@ -72,7 +71,7 @@ def check_all_leakage_sources():
     print("CHECK 3: Existing target encoding maps (from previous runs)")
     print(f"{'='*80}")
     
-    models_dir = Path(config['paths']['models_dir'])
+    models_dir = root / Path(config['paths']['models_dir'])
     feature_engineer_path = models_dir / 'feature_engineer.pkl'
     
     if feature_engineer_path.exists():

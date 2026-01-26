@@ -1,38 +1,31 @@
 # Configuration file for Insurance Renewal Prediction
 
 data:
-  # Dataset split strategy switch:
-  # - Set `active_split` to choose which generated train/test files to use.
-  # - Each split strategy MUST write separate train/test files to disk (see scripts/).
-  source_path: "dataset/WA_Fn-UseC_-Marketing-Customer-Value-Analysis.csv"
-  active_split: "timecut"  # "timecut" or "ratio"
-  splits:
-    # Strategy 1: split by Effective To Date cutoff (time-based)
-    timecut:
-      train_path: "dataset/WA_Fn-UseC_-Marketing-Customer-Value-Analysis—train_timecut.csv"
-      test_path: "dataset/WA_Fn-UseC_-Marketing-Customer-Value-Analysis—test_timecut.csv"
-      date_col: "Effective To Date"
-      cutoff: "2011-02-20"  # dates <= cutoff go to train
-    # Strategy 2: split by ratio (random split, optional stratification)
-    ratio:
-      train_path: "dataset/WA_Fn-UseC_-Marketing-Customer-Value-Analysis—train_ratio.csv"
-      test_path: "dataset/WA_Fn-UseC_-Marketing-Customer-Value-Analysis—test_ratio.csv"
-      test_size: 0.2
-      random_state: 42
-      stratify: true
+  # Data split strategy (ONLY 3 supported):
+  # - pre_split: use already-split train/test files on disk
+  # - timecut: split the original source file by a date cutoff (time-based holdout)
+  # - ratio: random split the original source file by test_size (optionally stratified)
+  strategy: "pre_split"  # "pre_split" | "timecut" | "ratio"
 
-  # Backward-compatible fields (will be overridden by active_split if provided)
-  train_path: "dataset/WA_Fn-UseC_-Marketing-Customer-Value-Analysis—train_timecut.csv"
-  test_path: "dataset/WA_Fn-UseC_-Marketing-Customer-Value-Analysis—test_timecut.csv"
-  
-  # If train_path and test_path are provided, they will be used
-  # Otherwise, single file will be split using test_size
-  use_separate_files: true  # Set to true to use separate train/test files
-  
+  # Common settings
   target_column: "Response"
-  test_size: 0.2  # Only used if use_separate_files is false
   random_state: 42
-  stratify: true  # Only used if use_separate_files is false
+  source_path: "dataset/WA_Fn-UseC_-Marketing-Customer-Value-Analysis.csv"
+
+  # Strategy 1) pre_split: use pre-generated train/test files
+  pre_split:
+    train_path: "dataset/train.csv"
+    test_path: "dataset/test.csv"
+
+  # Strategy 2) timecut: time-based split from the original file (no need to pre-generate CSVs)
+  timecut:
+    date_col: "Effective To Date"
+    cutoff: "2011-02-20"  # dates <= cutoff go to train
+
+  # Strategy 3) ratio: random split from the original file
+  ratio:
+    test_size: 0.2
+    stratify: true
 
 features:
   # Set to true to auto-discover features from data

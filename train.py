@@ -16,6 +16,7 @@ from sklearn.metrics import (
 )
 
 from src.utils.config import load_config, get_paths
+from src.utils.data_loading import load_train_test_data
 from src.utils.logger import setup_logger
 from src.utils.data_discovery import discover_features
 from src.utils.reporting import ModelReportGenerator
@@ -41,34 +42,15 @@ def main():
     logger.info("Starting Insurance Renewal Prediction Training Pipeline")
     logger.info("=" * 80)
 
-    # Step2 Load data - support both separate files and single file with split
-    use_separate_files = config['data'].get('use_separate_files', False)
+    # Step2 Load data (ONE unified entry): get df_train/df_test based on data.strategy
     target_column = config['data']['target_column']
+    df_train, df_test, resolved_split = load_train_test_data(config)
+    logger.info(f"Data split: {resolved_split.strategy} | details={resolved_split.details}")
+    logger.info(f"Training data loaded: Shape {df_train.shape}")
+    logger.info(f"Test data loaded: Shape {df_test.shape}")
 
-    if use_separate_files:
-        # Load separate train and test files
-        train_path = config['data']['train_path']
-        test_path = config['data'].get('test_path', None)
-
-        if not test_path:
-            raise ValueError("use_separate_files is True but test_path is not provided in config")
-
-        logger.info(f"Loading training data from {train_path}")
-        df_train = pd.read_csv(train_path)
-        logger.info(f"Training data loaded: Shape {df_train.shape}")
-
-        logger.info(f"Loading test data from {test_path}")
-        df_test = pd.read_csv(test_path)
-        logger.info(f"Test data loaded: Shape {df_test.shape}")
-
-        # Use training data for EDA and feature discovery
-        df = df_train.copy()
-
-    else:
-        # Load single file and split
-        logger.info(f"Loading data from {config['data']['train_path']}")
-        df = pd.read_csv(config['data']['train_path'])
-        logger.info(f"Data loaded: Shape {df.shape}")
+    # Use training data for EDA and feature discovery
+    df = df_train.copy()
 
     # Step3 EDA Analysis Auto-discover features if not specified in config
     discovered = discover_features(df, target_column=target_column)

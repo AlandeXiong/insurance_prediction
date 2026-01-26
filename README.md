@@ -9,10 +9,11 @@ A State-of-the-Art (SOTA) machine learning system for predicting insurance custo
 - **Auto Feature Discovery**: Automatic detection of categorical and numerical features
 - **Multiple SOTA Models**: LightGBM, XGBoost, CatBoost, and Ensemble
 - **Hyperparameter Optimization**: Optuna-based automated tuning with cross-validation
-- **Comprehensive Reporting**: Complete training, testing, and model accuracy reports
+- **Comprehensive Reporting**: Complete training, testing, and model performance reports (ROC-AUC + PR-AUC + threshold metrics)
 - **RESTful API**: FastAPI-based prediction service
 - **Modular Design**: Clean, maintainable code structure
-- **Imbalanced Learning Best Practice**: Class weights + threshold moving to maximize **precision** under **recall ≥ 0.6**
+- **Imbalanced Learning Best Practice**: Class weights + threshold moving with explicit constraints (**recall ≥ min_recall** and **precision ≥ min_precision**)
+- **Leakage-safe best model selection**: Best model is selected on **validation** by default (test set is a final holdout)
 
 ## 📁 Project Structure
 
@@ -30,6 +31,7 @@ InsurancePrediction/
 │   │   └── predictor.py
 │   └── utils/            # Utilities
 │       ├── config.py
+│       ├── data_loading.py
 │       ├── logger.py
 │       ├── data_discovery.py
 │       └── reporting.py
@@ -106,7 +108,7 @@ The system generates comprehensive reports including:
 
 ### Training Report (`outputs/reports/training_report.json`)
 - Cross-validation scores for all models
-- Test set performance metrics
+- Test set performance metrics (includes **PR-AUC**)
 - Best model identification
 - Feature importance rankings
 - Training time statistics
@@ -207,18 +209,52 @@ Key configuration options in `config.yaml`:
 
 ```yaml
 data:
-  train_path: "dataset/WA_Fn-UseC_-Marketing-Customer-Value-Analysis—train.csv"
-  test_path: "dataset/WA_Fn-UseC_-Marketing-Customer-Value-Analysis—test.csv"
-  use_separate_files: true
+  # Data split strategy (ONLY 3 supported):
+  # - pre_split: use already-split train/test files on disk
+  # - timecut: split the original source file by a date cutoff (time-based holdout)
+  # - ratio: random split the original source file by test_size (optionally stratified)
+  strategy: "pre_split"  # "pre_split" | "timecut" | "ratio"
+
   target_column: "Response"
   random_state: 42
+  source_path: "dataset/WA_Fn-UseC_-Marketing-Customer-Value-Analysis.csv"
+
+  # Strategy 1) pre_split
+  pre_split:
+    train_path: "dataset/WA_Fn-UseC_-Marketing-Customer-Value-Analysis—train_timecut.csv"
+    test_path: "dataset/WA_Fn-UseC_-Marketing-Customer-Value-Analysis—test_timecut.csv"
+
+  # Strategy 2) timecut (split from source_path)
+  timecut:
+    date_col: "Effective To Date"
+    cutoff: "2011-02-20"
+
+  # Strategy 3) ratio (random split from source_path)
+  ratio:
+    test_size: 0.2
+    stratify: true
 
 model:
   models: ["lightgbm", "xgboost", "catboost", "ensemble"]
   cv_folds: 5
   n_trials: 100
-  min_recall: 0.6
-  optimize_threshold: true
+  scoring: "roc_auc"   # Optuna/CV scoring: "roc_auc" or "average_precision"
+  min_recall: 0.5
+  # min_precision: 0.25
+
+  # Threshold selection:
+  threshold_strategy: "validation"  # "fixed" | "validation"
+  thresholds:
+    default: 0.5
+    lightgbm: 0.30
+    xgboost: 0.34
+    catboost: 0.38
+    ensemble: 0.35
+
+  # Best model selection (leakage-safe by default):
+  best_model_selection_dataset: "validation"   # "validation" | "test"
+  best_model_metric: "business_score"          # "business_score" | "pr_auc" | "roc_auc" | ...
+  best_model_fallback_metric: "pr_auc"
 
 training:
   mode: "fast"  # "fast" or "full"
@@ -268,6 +304,7 @@ This project follows Kaggle competition best practices:
 The system implements strict data leakage prevention:
 
 - **No test-label tuning**: thresholds are selected on validation data and applied to the test set
+- **No test-set model selection (default)**: best model is selected on validation metrics by default
 - **Automatic Checks**: Target column automatically removed if accidentally included in features
 - **Explicit Separation**: Clear separation between feature data and target data
 - **Training/Test Isolation**: Test data never used for feature engineering
