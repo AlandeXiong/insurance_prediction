@@ -42,8 +42,11 @@ InsurancePrediction/
 │   └── reports/          # Training and evaluation reports
 ├── logs/                 # Training logs
 ├── config.yaml           # Configuration file
+├── Dockerfile            # Container image for API service
+├── docker-compose.yml    # One-command deployment (API)
 ├── train.py              # Main training script
 ├── run_api.py            # API server script
+├── test_api.py           # Simple API smoke tests
 └── requirements.txt      # Dependencies
 ```
 
@@ -101,6 +104,38 @@ python run_api.py
 ```
 
 The API will be available at `http://localhost:8000`
+
+### 5. Docker Compose Deployment (Recommended for serving)
+
+**Prerequisite**: you must have trained artifacts in `./models/` (at least `feature_engineer.pkl` and one `*_model.pkl`).
+
+```bash
+# 1) Train (generates ./models/*)
+python train.py
+
+# 2) Start API service
+docker compose up --build
+```
+
+The compose service:
+- Mounts `./models` into the container at `/app/models`
+- Mounts `./config.yaml` into the container at `/app/config.yaml` (read-only)
+- Exposes API on `http://localhost:8000`
+
+### 6. API Testing (local or Docker)
+
+**Option A: curl smoke tests**
+
+```bash
+curl "http://localhost:8000/health"
+curl "http://localhost:8000/models"
+```
+
+**Option B: run the provided test script**
+
+```bash
+python test_api.py
+```
 
 ## 📊 Model Performance & Reporting
 
