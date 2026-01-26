@@ -1,0 +1,15 @@
+services:
+  api:
+    build: .
+    container_name: insurance-prediction-api
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONPATH=/app
+    volumes:
+      # Mount trained artifacts produced by `python train.py`
+      - ./models:/app/models
+      # Allow changing runtime config without rebuilding
+      - ./config.yaml:/app/config.yaml:ro
+    restart: unless-stopped
+

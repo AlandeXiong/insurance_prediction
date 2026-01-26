@@ -159,3 +159,15 @@ paths:
   models_dir: "models"
   outputs_dir: "outputs"
   logs_dir: "logs"
+
+# Post-training analysis
+analysis:
+  shap:
+    enabled: true
+    # Which model to explain: "best" or a specific name ("lightgbm" | "xgboost" | "catboost" | "ensemble")
+    model: "best"
+    # Which dataset to explain: "train" | "validation" | "test"
+    dataset: "train"
+    sample_size: 1000
+    background_size: 200
+    max_display: 20

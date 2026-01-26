@@ -13,6 +13,7 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
     f1_score,
+    precision_recall_curve,
 )
 
 from src.utils.config import load_config, get_paths
@@ -23,6 +24,7 @@ from src.utils.reporting import ModelReportGenerator
 from src.eda.explorer import DataExplorer
 from src.features.engineering import FeatureEngineer
 from src.models.trainer import ModelTrainer
+from src.utils.shap_analysis import run_shap_analysis
 
 
 def main():
@@ -380,11 +382,55 @@ def main():
     best_model_selection_dataset = str(model_cfg.get('best_model_selection_dataset', 'validation')).lower().strip()
     best_model_fallback_metric = str(model_cfg.get('best_model_fallback_metric', 'pr_auc')).lower().strip()
 
+    def _best_precision_under_constraints(y_true_arr: np.ndarray, proba_arr: np.ndarray) -> dict:
+        """
+        Diagnostic-only: best achievable precision subject to constraints on THIS dataset.
+
+        Returns numeric-only fields (safe for reporting formatter):
+        - business_score_opt: best precision achievable under constraints
+        - business_threshold_opt: threshold achieving that score (or -1.0 if infeasible)
+        - business_precision_opt / business_recall_opt: precision/recall at that threshold
+        """
+        p, r, t = precision_recall_curve(y_true_arr, proba_arr)
+        # candidates: include "predict all positive" point (threshold=0.0)
+        cand_t = [0.0]
+        cand_p = [float(p[0])]
+        cand_r = [float(r[0])]
+        for i, thr in enumerate(t):
+            cand_t.append(float(thr))
+            cand_p.append(float(p[i + 1]))
+            cand_r.append(float(r[i + 1]))
+
+        cand_t = np.asarray(cand_t, dtype=float)
+        cand_p = np.asarray(cand_p, dtype=float)
+        cand_r = np.asarray(cand_r, dtype=float)
+
+        feasible = np.where((cand_r >= float(min_recall)) & (cand_p >= float(min_precision)))[0]
+        if feasible.size == 0:
+            return {
+                "business_score_opt": 0.0,
+                "business_threshold_opt": -1.0,
+                "business_precision_opt": 0.0,
+                "business_recall_opt": 0.0,
+            }
+
+        # Max precision; tie-break by higher threshold (more conservative)
+        best_p = np.max(cand_p[feasible])
+        pool = feasible[np.where(np.isclose(cand_p[feasible], best_p, rtol=0, atol=1e-12))[0]]
+        best_idx = int(pool[np.argmax(cand_t[pool])])
+        return {
+            "business_score_opt": float(cand_p[best_idx]),
+            "business_threshold_opt": float(cand_t[best_idx]),
+            "business_precision_opt": float(cand_p[best_idx]),
+            "business_recall_opt": float(cand_r[best_idx]),
+        }
+
     def _eval_binary_metrics(y_true_arr: np.ndarray, proba_arr: np.ndarray, threshold_val: float) -> dict:
         y_pred_arr = (proba_arr >= float(threshold_val)).astype(int)
         prec = float(precision_score(y_true_arr, y_pred_arr, zero_division=0))
         rec = float(recall_score(y_true_arr, y_pred_arr))
         business = prec if (rec >= float(min_recall) and prec >= float(min_precision)) else 0.0
+        opt = _best_precision_under_constraints(y_true_arr, proba_arr)
         return {
             "roc_auc": float(roc_auc_score(y_true_arr, proba_arr)),
             "pr_auc": float(average_precision_score(y_true_arr, proba_arr)),
@@ -394,6 +440,8 @@ def main():
             "recall": rec,
             "f1": float(f1_score(y_true_arr, y_pred_arr)),
             "business_score": float(business),
+            "constraint_met": 1.0 if business > 0.0 else 0.0,
+            **opt,
             "threshold": float(threshold_val),
         }
 
@@ -403,6 +451,9 @@ def main():
     selection_source = None
 
     if best_model_selection_dataset == "validation" and X_val_processed is not None and y_val is not None:
+        """
+        Compute the Best Model
+        """
         logger.info("Selecting BEST MODEL on validation set (to avoid test-set model selection)...")
         selection_source = "validation"
         for model_name in list(trainer.models.keys()):
@@ -457,6 +508,7 @@ def main():
         business_score = float(precision_at_threshold) if (
             recall_at_threshold >= float(min_recall) and precision_at_threshold >= float(min_precision)
         ) else 0.0
+        opt = _best_precision_under_constraints(y_test.values, proba)
 
         test_results[model_name] = {
             "roc_auc": roc_auc_score(y_test, proba),
@@ -468,6 +520,8 @@ def main():
             "recall": recall_score(y_test, y_pred),
             "f1": f1_score(y_test, y_pred),
             "business_score": business_score,
+            "constraint_met": 1.0 if business_score > 0.0 else 0.0,
+            **opt,
             "threshold": float(threshold),
             "accuracy_default": accuracy_score(y_test, y_pred_default),
             "balanced_accuracy_default": balanced_accuracy_score(y_test, y_pred_default),
@@ -527,6 +581,54 @@ def main():
 
     # Save JSON report
     report_generator.save_report_json('training_report.json')
+
+    # SHAP analysis (optional)
+    shap_cfg = ((config.get("analysis", {}) or {}).get("shap", {}) or {})
+    if bool(shap_cfg.get("enabled", False)):
+        shap_model_key = str(shap_cfg.get("model", "best")).lower().strip()
+        shap_dataset = str(shap_cfg.get("dataset", "train")).lower().strip()
+        shap_sample_size = int(shap_cfg.get("sample_size", 1000))
+        shap_background_size = int(shap_cfg.get("background_size", 200))
+        shap_max_display = int(shap_cfg.get("max_display", 20))
+
+        try:
+            if shap_model_key in {"best", ""}:
+                shap_model_name = str(training_report.get("best_model") or "")
+            else:
+                shap_model_name = shap_model_key
+
+            model_obj = trainer.models.get(shap_model_name)
+            if model_obj is None:
+                raise ValueError(f"SHAP model '{shap_model_name}' not found in trained models: {list(trainer.models.keys())}")
+
+            if shap_dataset == "validation" and X_val_processed is not None:
+                X_shap = X_val_processed
+            elif shap_dataset == "test":
+                X_shap = X_test_processed
+            else:
+                X_shap = X_train_processed
+
+            shap_out_dir = (report_dir / "shap" / shap_model_name)
+            logger.info(
+                f"Running SHAP analysis (model={shap_model_name}, dataset={shap_dataset}, "
+                f"sample_size={shap_sample_size})..."
+            )
+            artifacts = run_shap_analysis(
+                model=model_obj,
+                model_name=shap_model_name,
+                X=X_shap,
+                output_dir=shap_out_dir,
+                sample_size=shap_sample_size,
+                background_size=shap_background_size,
+                max_display=shap_max_display,
+                random_state=int(config.get("data", {}).get("random_state", 42)),
+            )
+            logger.info(f"SHAP artifacts saved to: {artifacts.output_dir}")
+        except ImportError as e:
+            logger.warning(f"SHAP is enabled but not installed in current environment: {e}. "
+                           f"Install dependencies (e.g. `pip install -r requirements.txt`) to run SHAP.")
+        except Exception as e:
+            logger.warning(f"SHAP analysis skipped due to error: {e}")
 
     # Save models
     logger.info("Saving trained models...")
