@@ -152,6 +152,7 @@ The system generates comprehensive reports including:
 - **model_performance.png**: ROC curves, PR curves, confusion matrix, metric comparison
 - **feature_importance.png**: Top features for each model
 - **cv_comparison.png**: Cross-validation score distributions
+- **model_structure/** (optional, `analysis.model_structure.enabled: true`): Tree structure plots for LightGBM/XGBoost/CatBoost (first N trees per model) and per-model feature importance bar charts
 
 ### Text Summary (`outputs/reports/training_report.txt`)
 - Human-readable summary of all results
@@ -268,6 +269,13 @@ data:
   ratio:
     test_size: 0.2
     stratify: true
+
+  # Optional: deduplicate by feature columns before split; save unique + duplicates CSVs under outputs
+  deduplicate:
+    enabled: false
+    export_dir: "outputs/deduplicated"
+    export_unique_name: "unique.csv"
+    export_duplicates_name: "duplicates.csv"
 
 model:
   models: ["lightgbm", "xgboost", "catboost", "ensemble"]

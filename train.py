@@ -1,4 +1,5 @@
 """Main training script with comprehensive reporting pipeline"""
+import logging
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -38,8 +39,14 @@ def main():
     config = load_config()
     paths = get_paths(config)
 
-    # Setup logger
+    # Setup logger (training + data_loading so dedupe logs are visible)
     logger = setup_logger('training', paths['logs'])
+    for _name in ('src.utils.data_loading',):
+        _log = logging.getLogger(_name)
+        if not _log.handlers:
+            for h in logger.handlers:
+                _log.addHandler(h)
+            _log.setLevel(logging.INFO)
     logger.info("=" * 80)
     logger.info("Starting Insurance Renewal Prediction Training Pipeline")
     logger.info("=" * 80)
@@ -48,6 +55,16 @@ def main():
     target_column = config['data']['target_column']
     df_train, df_test, resolved_split = load_train_test_data(config)
     logger.info(f"Data split: {resolved_split.strategy} | details={resolved_split.details}")
+    # Log deduplication status (data_loading uses a different logger, so we log here for visibility)
+    dedupe_cfg = (config.get("data") or {}).get("deduplicate") or {}
+    if dedupe_cfg.get("enabled"):
+        export_dir = dedupe_cfg.get("export_dir") or "outputs/deduplicated"
+        unique_name = dedupe_cfg.get("export_unique_name") or "unique.csv"
+        dup_name = dedupe_cfg.get("export_duplicates_name") or "duplicates.csv"
+        logger.info(
+            f"Data deduplication applied (by feature columns). Unique and duplicates saved to "
+            f"{export_dir}/{unique_name}, {export_dir}/{dup_name}. Train/test split from unique set."
+        )
     logger.info(f"Training data loaded: Shape {df_train.shape}")
     logger.info(f"Test data loaded: Shape {df_test.shape}")
 
@@ -629,6 +646,31 @@ def main():
                            f"Install dependencies (e.g. `pip install -r requirements.txt`) to run SHAP.")
         except Exception as e:
             logger.warning(f"SHAP analysis skipped due to error: {e}")
+
+    # Model structure visualization (tree plots + optional feature importance)
+    struct_cfg = ((config.get("analysis", {}) or {}).get("model_structure", {}) or {})
+    if bool(struct_cfg.get("enabled", False)):
+        try:
+            from src.utils.model_visualization import run_model_structure_visualization
+            struct_out = report_dir / "model_structure"
+            max_trees = int(struct_cfg.get("max_trees_per_model", 3))
+            include_ensemble = bool(struct_cfg.get("include_ensemble_trees", True))
+            plot_imp = bool(struct_cfg.get("plot_feature_importance", True))
+            artifacts = run_model_structure_visualization(
+                models=trainer.models,
+                output_dir=struct_out,
+                max_trees_per_model=max_trees,
+                feature_importance=trainer.feature_importance if plot_imp else None,
+                include_ensemble_trees=include_ensemble,
+            )
+            logger.info(f"Model structure visualizations saved to: {struct_out}")
+            if artifacts.errors:
+                for err in artifacts.errors:
+                    logger.warning(f"Model structure: {err}")
+        except ImportError as e:
+            logger.warning(f"Model structure visualization skipped (missing deps): {e}")
+        except Exception as e:
+            logger.warning(f"Model structure visualization skipped due to error: {e}")
 
     # Save models
     logger.info("Saving trained models...")

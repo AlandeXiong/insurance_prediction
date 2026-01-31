@@ -172,6 +172,9 @@ class ModelTrainer:
                 "or remove 'lightgbm' from config.yaml model lists."
             )
         print("\nOptimizing LightGBM...")
+        # Debug: basic target distribution
+        unique, counts = np.unique(y_train, return_counts=True)
+        print(f"[DEBUG][lightgbm] y_train class distribution: {dict(zip(unique, counts))}")
 
         class_weights = self.compute_class_weights(y_train)
         scale_pos_weight = class_weights.get(1, 1.0) / class_weights.get(0, 1.0) if 0 in class_weights and 1 in class_weights else 1.0
@@ -212,11 +215,21 @@ class ModelTrainer:
                     ],
                 )
                 proba = model.predict_proba(X_val)[:, 1]
-                return float(self._score_from_proba(y_val.values, proba))
+                score = float(self._score_from_proba(y_val.values, proba))
+                print(
+                    f"[DEBUG][optuna][lightgbm][holdout] "
+                    f"trial={trial.number} {self.scoring}={score:.6f}"
+                )
+                if score > 0.98:
+                    print(
+                        f"[WARN][optuna][lightgbm][holdout] unusually high {self.scoring}={score:.6f}. "
+                        "Check for potential leakage or overly-easy split (time/ID features, target-like columns, etc.)."
+                    )
+                return score
 
             cv = StratifiedKFold(n_splits=self.cv_folds, shuffle=True, random_state=self.random_state)
             scores = []
-            for train_idx, val_idx in cv.split(X_train, y_train):
+            for fold, (train_idx, val_idx) in enumerate(cv.split(X_train, y_train)):
                 X_tr_f, X_val_f = X_train.iloc[train_idx], X_train.iloc[val_idx]
                 y_tr_f, y_val_f = y_train.iloc[train_idx], y_train.iloc[val_idx]
 
@@ -228,9 +241,27 @@ class ModelTrainer:
                     callbacks=[lgb.early_stopping(stopping_rounds=100, verbose=False)],
                 )
                 proba = model.predict_proba(X_val_f)[:, 1]
-                scores.append(self._score_from_proba(y_val_f.values, proba))
+                fold_score = float(self._score_from_proba(y_val_f.values, proba))
+                scores.append(fold_score)
+                print(
+                    f"[DEBUG][optuna][lightgbm][cv] trial={trial.number} "
+                    f"fold={fold} {self.scoring}={fold_score:.6f}"
+                )
 
-            return float(np.mean(scores))
+            mean_score = float(np.mean(scores))
+            std_score = float(np.std(scores))
+            print(
+                f"[DEBUG][optuna][lightgbm][cv] trial={trial.number} "
+                f"mean_{self.scoring}={mean_score:.6f} (+/- {std_score * 2:.6f}) "
+                f"scores={np.round(scores, 6).tolist()}"
+            )
+            if mean_score > 0.98:
+                print(
+                    f"[WARN][optuna][lightgbm][cv] unusually high mean {self.scoring}={mean_score:.6f}. "
+                    "This can indicate data leakage or a very easy split. "
+                    "Consider running leakage diagnostics (src/leakage/* scripts) and inspecting features."
+                )
+            return mean_score
 
         study = optuna.create_study(direction="maximize", study_name="lightgbm_opt")
         study.optimize(objective, n_trials=self.n_trials, show_progress_bar=True)
@@ -471,6 +502,8 @@ class ModelTrainer:
         Thresholds are controlled via config.yaml (per-model thresholds).
         """
         print("\nOptimizing XGBoost...")
+        unique, counts = np.unique(y_train, return_counts=True)
+        print(f"[DEBUG][xgboost] y_train class distribution: {dict(zip(unique, counts))}")
         
         # Compute class weights
         class_weights = self.compute_class_weights(y_train)
@@ -508,12 +541,22 @@ class ModelTrainer:
                     verbose=False,
                 )
                 y_pred_proba = model.predict_proba(X_val)[:, 1]
-                return float(self._score_from_proba(y_val.values, y_pred_proba))
+                score = float(self._score_from_proba(y_val.values, y_pred_proba))
+                print(
+                    f"[DEBUG][optuna][xgboost][holdout] "
+                    f"trial={trial.number} {self.scoring}={score:.6f}"
+                )
+                if score > 0.98:
+                    print(
+                        f"[WARN][optuna][xgboost][holdout] unusually high {self.scoring}={score:.6f}. "
+                        "Check for potential leakage or overly-easy split."
+                    )
+                return score
 
             cv = StratifiedKFold(n_splits=self.cv_folds, shuffle=True, random_state=self.random_state)
             scores = []
 
-            for train_idx, val_idx in cv.split(X_train, y_train):
+            for fold, (train_idx, val_idx) in enumerate(cv.split(X_train, y_train)):
                 X_tr_f, X_val_f = X_train.iloc[train_idx], X_train.iloc[val_idx]
                 y_tr_f, y_val_f = y_train.iloc[train_idx], y_train.iloc[val_idx]
 
@@ -527,9 +570,26 @@ class ModelTrainer:
                 )
 
                 y_pred_proba = model.predict_proba(X_val_f)[:, 1]
-                scores.append(self._score_from_proba(y_val_f.values, y_pred_proba))
+                fold_score = float(self._score_from_proba(y_val_f.values, y_pred_proba))
+                scores.append(fold_score)
+                print(
+                    f"[DEBUG][optuna][xgboost][cv] trial={trial.number} "
+                    f"fold={fold} {self.scoring}={fold_score:.6f}"
+                )
 
-            return float(np.mean(scores))
+            mean_score = float(np.mean(scores))
+            std_score = float(np.std(scores))
+            print(
+                f"[DEBUG][optuna][xgboost][cv] trial={trial.number} "
+                f"mean_{self.scoring}={mean_score:.6f} (+/- {std_score * 2:.6f}) "
+                f"scores={np.round(scores, 6).tolist()}"
+            )
+            if mean_score > 0.98:
+                print(
+                    f"[WARN][optuna][xgboost][cv] unusually high mean {self.scoring}={mean_score:.6f}. "
+                    "This can indicate data leakage or a very easy split."
+                )
+            return mean_score
         
         study = optuna.create_study(direction='maximize', study_name='xgboost_opt')
         study.optimize(objective, n_trials=self.n_trials, show_progress_bar=True)
@@ -564,6 +624,8 @@ class ModelTrainer:
         Thresholds are controlled via config.yaml (per-model thresholds).
         """
         print("\nOptimizing CatBoost...")
+        unique, counts = np.unique(y_train, return_counts=True)
+        print(f"[DEBUG][catboost] y_train class distribution: {dict(zip(unique, counts))}")
         
         # Compute class weights
         class_weights = self.compute_class_weights(y_train)
@@ -604,12 +666,22 @@ class ModelTrainer:
                     verbose=False,
                 )
                 y_pred_proba = model.predict_proba(X_val)[:, 1]
-                return float(self._score_from_proba(y_val.values, y_pred_proba))
+                score = float(self._score_from_proba(y_val.values, y_pred_proba))
+                print(
+                    f"[DEBUG][optuna][catboost][holdout] "
+                    f"trial={trial.number} {self.scoring}={score:.6f}"
+                )
+                if score > 0.98:
+                    print(
+                        f"[WARN][optuna][catboost][holdout] unusually high {self.scoring}={score:.6f}. "
+                        "Check for potential leakage or overly-easy split."
+                    )
+                return score
 
             cv = StratifiedKFold(n_splits=self.cv_folds, shuffle=True, random_state=self.random_state)
             scores = []
 
-            for train_idx, val_idx in cv.split(X_train, y_train):
+            for fold, (train_idx, val_idx) in enumerate(cv.split(X_train, y_train)):
                 X_tr_f, X_val_f = X_train.iloc[train_idx], X_train.iloc[val_idx]
                 y_tr_f, y_val_f = y_train.iloc[train_idx], y_train.iloc[val_idx]
                 cat_features = self._cat_feature_indices(X_tr_f, cat_feature_names)
@@ -624,9 +696,26 @@ class ModelTrainer:
                 )
 
                 y_pred_proba = model.predict_proba(X_val_f)[:, 1]
-                scores.append(self._score_from_proba(y_val_f.values, y_pred_proba))
+                fold_score = float(self._score_from_proba(y_val_f.values, y_pred_proba))
+                scores.append(fold_score)
+                print(
+                    f"[DEBUG][optuna][catboost][cv] trial={trial.number} "
+                    f"fold={fold} {self.scoring}={fold_score:.6f}"
+                )
 
-            return float(np.mean(scores))
+            mean_score = float(np.mean(scores))
+            std_score = float(np.std(scores))
+            print(
+                f"[DEBUG][optuna][catboost][cv] trial={trial.number} "
+                f"mean_{self.scoring}={mean_score:.6f} (+/- {std_score * 2:.6f}) "
+                f"scores={np.round(scores, 6).tolist()}"
+            )
+            if mean_score > 0.98:
+                print(
+                    f"[WARN][optuna][catboost][cv] unusually high mean {self.scoring}={mean_score:.6f}. "
+                    "This can indicate data leakage or a very easy split."
+                )
+            return mean_score
         
         study = optuna.create_study(direction='maximize', study_name='catboost_opt')
         study.optimize(objective, n_trials=self.n_trials, show_progress_bar=True)

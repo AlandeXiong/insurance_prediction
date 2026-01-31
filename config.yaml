@@ -5,7 +5,7 @@ data:
   # - pre_split: use already-split train/test files on disk
   # - timecut: split the original source file by a date cutoff (time-based holdout)
   # - ratio: random split the original source file by test_size (optionally stratified)
-  strategy: "pre_split"  # "pre_split" | "timecut" | "ratio"
+  strategy: "ratio"  # "pre_split" | "timecut" | "ratio"
 
   # Common settings
   target_column: "Response"
@@ -26,6 +26,13 @@ data:
   ratio:
     test_size: 0.2
     stratify: true
+
+  # Deduplicate by features before split: generate unique + duplicates files, then split train/test from unique only
+  deduplicate:
+    enabled: true
+    export_dir: "outputs/deduplicated"
+    export_unique_name: "unique.csv"
+    export_duplicates_name: "duplicates.csv"
 
 features:
   # Set to true to auto-discover features from data
@@ -122,11 +129,12 @@ training:
     n_trials: 15  # Reduced optimization trials
     cv_folds: 3  # Fewer CV folds
     models: ["lightgbm", "xgboost", "catboost", "ensemble"]  # Fewer models to train
-    # FAST tuning settings (speed-first)
-    # - strategy: "holdout" runs ONE stratified split per Optuna trial (much faster than KFold)
+    # FAST tuning settings
+    # - strategy: "kfold" uses StratifiedKFold per Optuna trial (more stable than holdout)
+    # - strategy: "holdout" runs ONE stratified split per trial (faster but less stable)
     # - budgets: cap estimators/iterations during tuning only
     tuning:
-      strategy: "holdout"
+      strategy: "kfold"
       holdout_size: 0.2
       early_stopping_rounds: 30
       lightgbm_n_estimators: 800
@@ -171,3 +179,13 @@ analysis:
     sample_size: 1000
     background_size: 200
     max_display: 20
+
+  # Model structure visualization (tree plots + optional feature importance)
+  model_structure:
+    enabled: true
+    # Max number of trees to plot per model (first N trees)
+    max_trees_per_model: 3
+    # Plot base estimators of ensemble (lightgbm/xgboost/catboost trees inside ensemble)
+    include_ensemble_trees: true
+    # Plot feature importance bar chart per model (saved under output_dir/feature_importance/)
+    plot_feature_importance: true
